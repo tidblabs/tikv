@@ -4643,7 +4643,9 @@ dependencies = [
  "crossbeam-skiplist 0.0.0 (git+https://github.com/crossbeam-rs/crossbeam)",
  "dashmap",
  "kvproto",
+ "lazy_static",
  "pin-project",
+ "prometheus",
  "slog",
  "slog-global",
  "tikv_util",
@@ -7327,7 +7329,7 @@ checksum = "541b12c998c5b56aa2b4e6f18f03664eef9a4fd0a246a55594efae6cc2d964b5"
 [[package]]
 name = "yatp"
 version = "0.0.1"
-source = "git+https://github.com/glorv/yatp?branch=priority-schedule#65a243bba6474c2dae047cf3bede7b1d0f0c8caa"
+source = "git+https://github.com/glorv/yatp?branch=priority-schedule#02d46d074a5c3a044b80e8da49b6e43b54518939"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-skiplist 0.0.0 (git+https://github.com/crossbeam-rs/crossbeam)",

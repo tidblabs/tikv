@@ -13,7 +13,9 @@ use std::{
 use byteorder::{BigEndian, ReadBytesExt};
 use dashmap::{DashMap, mapref::one::Ref};
 use kvproto::kvrpcpb::CommandPri;
+use lazy_static::lazy_static;
 use pin_project::pin_project;
+use prometheus::*;
 use tikv_util::{sys::SysQuota, time::Instant};
 use yatp::queue::priority::set_task_priority;
 
@@ -21,6 +23,13 @@ const DEFAULT_PRIORITY_PER_TASK: u64 = 100; // a task cost at least 100us.
 // extra task schedule factor
 const TASK_EXTRA_FACTOR_BY_LEVEL: [u64; 3] = [1, 20, 100];
 const MIN_DURATION_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+
+lazy_static! {
+    static ref GROUP_PRIORITY: GaugeVec = register_gauge_vec!(
+        "tikv_rc_group_priority", "Current group prioitry",
+        &["group"],
+    ).unwrap();
+}
 
 pub struct ResourceController {
     resource_groups: DashMap<u64, Arc<ResourceGroup>>,
@@ -71,7 +80,14 @@ impl ResourceController {
 
     #[inline]
     fn resource_group(&self, group_id: u64) -> Ref<u64, Arc<ResourceGroup>> {
-        self.resource_groups.get(&group_id).unwrap_or_else(|| self.resource_groups.get(&0).unwrap())
+        //self.resource_groups.get(&group_id).unwrap_or_else(|| self.resource_groups.get(&0).unwrap())
+
+        if let Some(group) = self.resource_groups.get(&group_id) {
+            return group;
+        }
+
+        self.add_resource_group(ResourceGroupConfig::new(group_id, "".into(), self.total_cpu_quota, 0, 0));
+        self.resource_groups.get(&group_id).unwrap()
     }
 
     pub fn get_priority(&self, group_id: u64, priority: CommandPri) -> u64 {
@@ -107,10 +123,11 @@ impl ResourceController {
         let mut max_vt = 0;
         self.resource_groups.iter().for_each(|g| {
             let vt = g.current_vt();
-            if min_vt < vt {
+            GROUP_PRIORITY.with_label_values(&[&format!("{}", g.config.id)]).set(vt as f64);
+            if min_vt > vt {
                 min_vt = vt;
             }
-            if max_vt > vt {
+            if max_vt < vt {
                 max_vt = vt;
             }
         });
@@ -124,7 +141,7 @@ impl ResourceController {
             let vt = g.current_vt();
             if vt < max_vt {
                 // TODO: is increase by half is a good choice.
-                g.increase_vt((max_vt - vt) / 2)
+                g.increase_vt((max_vt - vt) / 2);
             }
         });
         // max_vt is actually a little bigger than the current min vt, but we don't 
