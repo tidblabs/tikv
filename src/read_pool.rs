@@ -2,7 +2,11 @@
 
 use std::{
     future::Future,
-    sync::{mpsc::SyncSender, Arc, Mutex, atomic::{AtomicBool, Ordering}},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::SyncSender,
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -11,6 +15,7 @@ use futures::{channel::oneshot, future::TryFutureExt};
 use kvproto::kvrpcpb::CommandPri;
 use online_config::{ConfigChange, ConfigManager, ConfigValue, Result as CfgResult};
 use prometheus::{IntCounter, IntGauge};
+use resource_control::{ControlledFuture, ResourceController};
 use thiserror::Error;
 use tikv_util::{
     sys::{cpu_time::ProcessStat, SysQuota},
@@ -22,7 +27,6 @@ use tracker::TrackedFuture;
 use yatp::{
     metrics::MULTILEVEL_LEVEL_ELAPSED, pool::Remote, queue::Extras, task::future::TaskCell,
 };
-use resource_control::{ControlledFuture, ResourceController};
 
 use self::metrics::*;
 use crate::{
@@ -114,7 +118,13 @@ pub enum ReadPoolHandle {
 }
 
 impl ReadPoolHandle {
-    pub fn spawn<F>(&self, f: F, priority: CommandPri, task_id: u64, group_id: u64) -> Result<(), ReadPoolError>
+    pub fn spawn<F>(
+        &self,
+        f: F,
+        priority: CommandPri,
+        task_id: u64,
+        group_id: u64,
+    ) -> Result<(), ReadPoolError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -161,10 +171,16 @@ impl ReadPoolHandle {
                     let priority_value = resource_ctl.get_priority(group_id, priority);
                     extras.set_priority(priority_value);
                     let task_cell = TaskCell::new(
-                        TrackedFuture::new(ControlledFuture::new(async move {
-                            f.await;
-                            running_tasks.dec();
-                        }, resource_ctl.clone(), group_id, priority)), extras,
+                        TrackedFuture::new(ControlledFuture::new(
+                            async move {
+                                f.await;
+                                running_tasks.dec();
+                            },
+                            resource_ctl.clone(),
+                            group_id,
+                            priority,
+                        )),
+                        extras,
                     );
                     remote_priority.spawn(task_cell);
                 } else {
@@ -177,7 +193,6 @@ impl ReadPoolHandle {
                     );
                     remote.spawn(task_cell);
                 }
-                
             }
         }
         Ok(())
@@ -463,14 +478,14 @@ impl Runnable for ReadPoolConfigRunner {
                     self.cur_thread_count = self.core_thread_count;
                 }
             }
-            Task::EnablePriority(e) => {
-                match &self.handle {
-                    ReadPoolHandle::Yatp { enable_priority, .. } => {
-                        enable_priority.store(e, Ordering::Relaxed);
-                    }
-                    _ => {},
+            Task::EnablePriority(e) => match &self.handle {
+                ReadPoolHandle::Yatp {
+                    enable_priority, ..
+                } => {
+                    enable_priority.store(e, Ordering::Relaxed);
                 }
-            }
+                _ => {}
+            },
         }
     }
 }

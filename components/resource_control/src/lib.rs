@@ -1,17 +1,19 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-
 use std::{
     cell::Cell,
     future::Future,
-    pin::Pin, 
-    sync::{atomic::{AtomicU64, Ordering}, Arc}, 
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
     time::Duration,
 };
 
 use byteorder::{BigEndian, ReadBytesExt};
-use dashmap::{DashMap, mapref::one::Ref};
+use dashmap::{mapref::one::Ref, DashMap};
 use kvproto::kvrpcpb::CommandPri;
 use lazy_static::lazy_static;
 use pin_project::pin_project;
@@ -26,9 +28,11 @@ const MIN_DURATION_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 lazy_static! {
     static ref GROUP_PRIORITY: GaugeVec = register_gauge_vec!(
-        "tikv_rc_group_priority", "Current group prioitry",
+        "tikv_rc_group_priority",
+        "Current group prioitry",
         &["group"],
-    ).unwrap();
+    )
+    .unwrap();
 }
 
 pub struct ResourceController {
@@ -43,8 +47,8 @@ pub struct ResourceController {
 impl ResourceController {
     pub fn new() -> Self {
         let total_cpu_quota = SysQuota::cpu_cores_quota() * 1000.0;
-        let r = Self { 
-            resource_groups: DashMap::new(), 
+        let r = Self {
+            resource_groups: DashMap::new(),
             total_cpu_quota,
             last_min_vt: AtomicU64::new(0),
             start_ts: Instant::now_coarse(),
@@ -57,11 +61,11 @@ impl ResourceController {
     fn init_default_group(&self) {
         // grant half of the resource to the default group.
         let cpu_quota = self.total_cpu_quota / 2.0;
-        let default_group_cfg = ResourceGroupConfig { 
-            id: 0, 
-            name: "default".into(), 
-            cpu_quota, 
-            read_bytes_per_sec: 0, 
+        let default_group_cfg = ResourceGroupConfig {
+            id: 0,
+            name: "default".into(),
+            cpu_quota,
+            read_bytes_per_sec: 0,
             write_bytes_per_sec: 0,
         };
         self.add_resource_group(default_group_cfg);
@@ -80,13 +84,20 @@ impl ResourceController {
 
     #[inline]
     fn resource_group(&self, group_id: u64) -> Ref<u64, Arc<ResourceGroup>> {
-        //self.resource_groups.get(&group_id).unwrap_or_else(|| self.resource_groups.get(&0).unwrap())
+        // self.resource_groups.get(&group_id).unwrap_or_else(||
+        // self.resource_groups.get(&0).unwrap())
 
         if let Some(group) = self.resource_groups.get(&group_id) {
             return group;
         }
 
-        self.add_resource_group(ResourceGroupConfig::new(group_id, "".into(), self.total_cpu_quota, 0, 0));
+        self.add_resource_group(ResourceGroupConfig::new(
+            group_id,
+            "".into(),
+            self.total_cpu_quota,
+            0,
+            0,
+        ));
         self.resource_groups.get(&group_id).unwrap()
     }
 
@@ -102,7 +113,7 @@ impl ResourceController {
         thread_local! {
             static TASK_COUNTER: Cell<u64> = Cell::new(0);
         }
-        if  !TASK_COUNTER.with(|c| {
+        if !TASK_COUNTER.with(|c| {
             let count = c.get() + 1;
             c.set(count);
             count % 1000 == 0
@@ -115,7 +126,11 @@ impl ResourceController {
             return;
         }
         // updated by other thread
-        if self.last_vt_update_time.compare_exchange(last_update_since, now, Ordering::SeqCst, Ordering::Relaxed).is_err() {
+        if self
+            .last_vt_update_time
+            .compare_exchange(last_update_since, now, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
             return;
         }
 
@@ -123,7 +138,9 @@ impl ResourceController {
         let mut max_vt = 0;
         self.resource_groups.iter().for_each(|g| {
             let vt = g.current_vt();
-            GROUP_PRIORITY.with_label_values(&[&format!("{}", g.config.id)]).set(vt as f64);
+            GROUP_PRIORITY
+                .with_label_values(&[&format!("{}", g.config.id)])
+                .set(vt as f64);
             if min_vt > vt {
                 min_vt = vt;
             }
@@ -144,7 +161,7 @@ impl ResourceController {
                 g.increase_vt((max_vt - vt) / 2);
             }
         });
-        // max_vt is actually a little bigger than the current min vt, but we don't 
+        // max_vt is actually a little bigger than the current min vt, but we don't
         // need totally accurate here.
         self.last_min_vt.store(max_vt, Ordering::Relaxed);
     }
@@ -159,7 +176,13 @@ pub struct ResourceGroupConfig {
 }
 
 impl ResourceGroupConfig {
-    pub fn new(id: u64, name: String, cpu_quota: f64, read_bytes_per_sec: u64, write_bytes_per_sec: u64) -> Self {
+    pub fn new(
+        id: u64,
+        name: String,
+        cpu_quota: f64,
+        read_bytes_per_sec: u64,
+        write_bytes_per_sec: u64,
+    ) -> Self {
         Self {
             id,
             name,
@@ -185,8 +208,10 @@ impl ResourceGroup {
         };
         let task_extra_priority = TASK_EXTRA_FACTOR_BY_LEVEL[level] * 1000 * self.priority_factor;
         let base_priority_delta = DEFAULT_PRIORITY_PER_TASK * self.priority_factor;
-        self.virtual_time.fetch_add(base_priority_delta, Ordering::Relaxed) 
-            + base_priority_delta  + task_extra_priority
+        self.virtual_time
+            .fetch_add(base_priority_delta, Ordering::Relaxed)
+            + base_priority_delta
+            + task_extra_priority
     }
 
     #[inline]
@@ -216,7 +241,12 @@ pub struct ControlledFuture<F> {
 }
 
 impl<F> ControlledFuture<F> {
-    pub fn new(future: F, controller: Arc<ResourceController>, group_id: u64, priority: CommandPri) -> Self {
+    pub fn new(
+        future: F,
+        controller: Arc<ResourceController>,
+        group_id: u64,
+        priority: CommandPri,
+    ) -> Self {
         Self {
             future,
             controller,
@@ -233,7 +263,8 @@ impl<F: Future> Future for ControlledFuture<F> {
         let this = self.project();
         let now = Instant::now();
         let res = this.future.poll(cx);
-        this.controller.consume(*this.group_id, now.saturating_elapsed());
+        this.controller
+            .consume(*this.group_id, now.saturating_elapsed());
         if res.is_pending() {
             set_task_priority(this.controller.get_priority(*this.group_id, *this.priority));
         }

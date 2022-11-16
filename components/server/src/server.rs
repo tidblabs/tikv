@@ -63,7 +63,6 @@ use kvproto::{
 };
 use pd_client::{PdClient, RpcClient};
 use raft_log_engine::RaftLogEngine;
-use resource_control::ResourceController;
 use raftstore::{
     coprocessor::{
         config::SplitCheckConfigManager, BoxConsistencyCheckObserver, ConsistencyCheckMethod,
@@ -82,6 +81,7 @@ use raftstore::{
     },
     RaftRouterCompactedEventSender,
 };
+use resource_control::ResourceController;
 use security::SecurityManager;
 use snap_recovery::RecoveryService;
 use tikv::{
