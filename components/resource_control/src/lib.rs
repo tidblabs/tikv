@@ -178,7 +178,12 @@ pub struct ResourceGroup {
 
 impl ResourceGroup {
     fn get_priority(&self, priority: CommandPri) -> u64 {
-        let task_extra_priority = TASK_EXTRA_FACTOR_BY_LEVEL[priority as i32 as usize] * 1000 * self.priority_factor;
+        let level = match priority {
+            CommandPri::High => 0,
+            CommandPri::Normal => 0,
+            CommandPri::Low => 2,
+        };
+        let task_extra_priority = TASK_EXTRA_FACTOR_BY_LEVEL[level] * 1000 * self.priority_factor;
         let base_priority_delta = DEFAULT_PRIORITY_PER_TASK * self.priority_factor;
         self.virtual_time.fetch_add(base_priority_delta, Ordering::Relaxed) 
             + base_priority_delta  + task_extra_priority
