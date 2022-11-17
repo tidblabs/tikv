@@ -684,7 +684,7 @@ where
                             (Method::PUT, path) if path.starts_with("/log-level") => {
                                 Self::change_log_level(req).await
                             }
-                            (Method::GET, "/resource_group") => {
+                            (Method::GET, "/resource_groups") => {
                                 Self::get_all_resource_groups(&*resource_ctl).await
                             }
                             (Method::POST, "/resource_group") => {
