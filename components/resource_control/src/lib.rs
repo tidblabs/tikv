@@ -72,7 +72,7 @@ impl ResourceController {
     }
 
     pub fn add_resource_group(&self, config: ResourceGroupConfig) -> Option<Arc<ResourceGroup>> {
-        let name = config.name.clone();
+        let name = config.name.to_lowercase();
         let priority_factor = (self.total_cpu_quota / config.cpu_quota * 100.0) as u64;
         let group = Arc::new(ResourceGroup {
             config,
