@@ -87,6 +87,10 @@ impl ResourceController {
         self.resource_groups.remove(&id).map(|kv| kv.1)
     }
 
+    pub fn get_all_resource_groups(&self) -> Vec<ResourceGroupConfig> {
+        self.resource_groups.iter().map(|g| g.config.clone()).collect()
+    }
+
     #[inline]
     fn resource_group(&self, group_id: u64) -> Ref<u64, Arc<ResourceGroup>> {
         self.resource_groups
@@ -173,10 +177,9 @@ impl ResourceController {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct ResourceGroupConfig {
-    #[serde(rename = "resource-group-id")]
     id: u64,
     name: String,
     cpu_quota: f64,

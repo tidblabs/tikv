@@ -440,27 +440,14 @@ where
     }
 
     async fn delete_resource_group(
-        req: Request<Body>,
+        group_id_str: &str,
         resource_ctl: &ResourceController,
     ) -> hyper::Result<Response<Body>> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "kebab-case")]
-        struct RGroupID {
-            resource_group_id: u64,
-        }
-
-        let mut body = Vec::new();
-        req.into_body()
-            .try_for_each(|bytes| {
-                body.extend(bytes);
-                ok(())
-            })
-            .await?;
-        match serde_json::from_slice::<RGroupID>(&body) {
-            Ok(rg) => {
+        match group_id_str.parse() {
+            Ok(id) => {
                 let mut resp = Response::default();
                 if resource_ctl
-                    .remove_resource_group(rg.resource_group_id)
+                    .remove_resource_group(id)
                     .is_some()
                 {
                     *resp.status_mut() = StatusCode::OK;
@@ -469,11 +456,22 @@ where
                 }
                 Ok(resp)
             }
-            Err(e) => Ok(make_response(
-                StatusCode::BAD_REQUEST,
-                format!("invalid resource group id, error: {:?}", e),
-            )),
+            Err(e) => {
+                Ok(make_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid resource group id '{}', error: {:?}", group_id_str, e),
+                ))
+            }
         }
+    }
+
+    async fn get_all_resource_groups(resource_ctl: &ResourceController) -> hyper::Result<Response<Body>> {
+        let groups = resource_ctl.get_all_resource_groups();
+        let res = serde_json::to_string(&groups).unwrap();
+        Ok(Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(res))
+                .unwrap())
     }
 
     pub fn stop(self) {
@@ -697,11 +695,14 @@ where
                             (Method::PUT, path) if path.starts_with("/log-level") => {
                                 Self::change_log_level(req).await
                             }
+                            (Method::GET, "/resource_group") => {
+                                Self::get_all_resource_groups(&*resource_ctl).await
+                            }
                             (Method::POST, "/resource_group") => {
                                 Self::update_resource_group(req, &*resource_ctl).await
                             }
-                            (Method::DELETE, "/resource_group") => {
-                                Self::delete_resource_group(req, &*resource_ctl).await
+                            (Method::DELETE, path) if path.starts_with("/resource_group/") => {
+                                Self::delete_resource_group(&path[16..], &*resource_ctl).await
                             }
 
                             _ => Ok(make_response(StatusCode::NOT_FOUND, "path not found")),
