@@ -18,6 +18,7 @@ use kvproto::kvrpcpb::CommandPri;
 use lazy_static::lazy_static;
 use pin_project::pin_project;
 use prometheus::*;
+use serde::{Deserialize, Serialize};
 use tikv_util::{sys::SysQuota, time::Instant};
 use yatp::queue::priority::set_task_priority;
 
@@ -65,8 +66,8 @@ impl ResourceController {
             id: 0,
             name: "default".into(),
             cpu_quota,
-            read_bytes_per_sec: 0,
-            write_bytes_per_sec: 0,
+            read_bandwidth: 0,
+            write_bandwidth: 0,
         };
         self.add_resource_group(default_group_cfg);
     }
@@ -82,23 +83,28 @@ impl ResourceController {
         self.resource_groups.insert(id, group);
     }
 
+    pub fn remove_resource_group(&self, id: u64) -> Option<Arc<ResourceGroup>> {
+        self.resource_groups.remove(&id).map(|kv| kv.1)
+    }
+
     #[inline]
     fn resource_group(&self, group_id: u64) -> Ref<u64, Arc<ResourceGroup>> {
-        // self.resource_groups.get(&group_id).unwrap_or_else(||
-        // self.resource_groups.get(&0).unwrap())
+        self.resource_groups
+            .get(&group_id)
+            .unwrap_or_else(|| self.resource_groups.get(&0).unwrap())
 
-        if let Some(group) = self.resource_groups.get(&group_id) {
-            return group;
-        }
+        // if let Some(group) = self.resource_groups.get(&group_id) {
+        //     return group;
+        // }
 
-        self.add_resource_group(ResourceGroupConfig::new(
-            group_id,
-            "".into(),
-            self.total_cpu_quota,
-            0,
-            0,
-        ));
-        self.resource_groups.get(&group_id).unwrap()
+        // self.add_resource_group(ResourceGroupConfig::new(
+        //     group_id,
+        //     "".into(),
+        //     self.total_cpu_quota,
+        //     0,
+        //     0,
+        // ));
+        // self.resource_groups.get(&group_id).unwrap()
     }
 
     pub fn get_priority(&self, group_id: u64, priority: CommandPri) -> u64 {
@@ -167,12 +173,15 @@ impl ResourceController {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct ResourceGroupConfig {
+    #[serde(rename = "resource-group-id")]
     id: u64,
     name: String,
     cpu_quota: f64,
-    read_bytes_per_sec: u64,
-    write_bytes_per_sec: u64,
+    read_bandwidth: u64,
+    write_bandwidth: u64,
 }
 
 impl ResourceGroupConfig {
@@ -180,15 +189,15 @@ impl ResourceGroupConfig {
         id: u64,
         name: String,
         cpu_quota: f64,
-        read_bytes_per_sec: u64,
-        write_bytes_per_sec: u64,
+        read_bandwidth: u64,
+        write_bandwidth: u64,
     ) -> Self {
         Self {
             id,
             name,
             cpu_quota,
-            read_bytes_per_sec,
-            write_bytes_per_sec,
+            read_bandwidth,
+            write_bandwidth,
         }
     }
 }
