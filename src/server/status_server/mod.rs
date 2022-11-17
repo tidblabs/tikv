@@ -446,32 +446,32 @@ where
         match group_id_str.parse() {
             Ok(id) => {
                 let mut resp = Response::default();
-                if resource_ctl
-                    .remove_resource_group(id)
-                    .is_some()
-                {
+                if resource_ctl.remove_resource_group(id).is_some() {
                     *resp.status_mut() = StatusCode::OK;
                 } else {
                     *resp.status_mut() = StatusCode::NOT_FOUND;
                 }
                 Ok(resp)
             }
-            Err(e) => {
-                Ok(make_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid resource group id '{}', error: {:?}", group_id_str, e),
-                ))
-            }
+            Err(e) => Ok(make_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "invalid resource group id '{}', error: {:?}",
+                    group_id_str, e
+                ),
+            )),
         }
     }
 
-    async fn get_all_resource_groups(resource_ctl: &ResourceController) -> hyper::Result<Response<Body>> {
+    async fn get_all_resource_groups(
+        resource_ctl: &ResourceController,
+    ) -> hyper::Result<Response<Body>> {
         let groups = resource_ctl.get_all_resource_groups();
         let res = serde_json::to_string(&groups).unwrap();
         Ok(Response::builder()
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(res))
-                .unwrap())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(res))
+            .unwrap())
     }
 
     pub fn stop(self) {

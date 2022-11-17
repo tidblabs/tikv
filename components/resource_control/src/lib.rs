@@ -88,7 +88,10 @@ impl ResourceController {
     }
 
     pub fn get_all_resource_groups(&self) -> Vec<ResourceGroupConfig> {
-        self.resource_groups.iter().map(|g| g.config.clone()).collect()
+        self.resource_groups
+            .iter()
+            .map(|g| g.config.clone())
+            .collect()
     }
 
     #[inline]
