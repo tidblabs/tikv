@@ -440,27 +440,16 @@ where
     }
 
     async fn delete_resource_group(
-        group_id_str: &str,
+        group_name: &str,
         resource_ctl: &ResourceController,
     ) -> hyper::Result<Response<Body>> {
-        match group_id_str.parse() {
-            Ok(id) => {
-                let mut resp = Response::default();
-                if resource_ctl.remove_resource_group(id).is_some() {
-                    *resp.status_mut() = StatusCode::OK;
-                } else {
-                    *resp.status_mut() = StatusCode::NOT_FOUND;
-                }
-                Ok(resp)
-            }
-            Err(e) => Ok(make_response(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "invalid resource group id '{}', error: {:?}",
-                    group_id_str, e
-                ),
-            )),
+        let mut resp = Response::default();
+        if resource_ctl.remove_resource_group(group_name).is_some() {
+            *resp.status_mut() = StatusCode::OK;
+        } else {
+            *resp.status_mut() = StatusCode::NOT_FOUND;
         }
+        Ok(resp)
     }
 
     async fn get_all_resource_groups(

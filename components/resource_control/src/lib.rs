@@ -12,7 +12,6 @@ use std::{
     time::Duration,
 };
 
-use byteorder::{BigEndian, ReadBytesExt};
 use dashmap::{mapref::one::Ref, DashMap};
 use kvproto::kvrpcpb::CommandPri;
 use lazy_static::lazy_static;
@@ -37,7 +36,7 @@ lazy_static! {
 }
 
 pub struct ResourceController {
-    resource_groups: DashMap<u64, Arc<ResourceGroup>>,
+    resource_groups: DashMap<String, Arc<ResourceGroup>>,
     total_cpu_quota: f64,
     last_min_vt: AtomicU64,
     start_ts: Instant,
@@ -59,7 +58,7 @@ impl ResourceController {
         r
     }
 
-    fn init_default_group(&self) {
+    fn init_default_group(&self) -> Option<Arc<ResourceGroup>> {
         // grant half of the resource to the default group.
         let cpu_quota = self.total_cpu_quota / 2.0;
         let default_group_cfg = ResourceGroupConfig {
@@ -69,22 +68,26 @@ impl ResourceController {
             read_bandwidth: 0,
             write_bandwidth: 0,
         };
-        self.add_resource_group(default_group_cfg);
+        self.add_resource_group(default_group_cfg)
     }
 
-    pub fn add_resource_group(&self, config: ResourceGroupConfig) {
-        let id = config.id;
+    pub fn add_resource_group(&self, config: ResourceGroupConfig) -> Option<Arc<ResourceGroup>> {
+        let name = config.name.clone();
         let priority_factor = (self.total_cpu_quota / config.cpu_quota * 100.0) as u64;
         let group = Arc::new(ResourceGroup {
             config,
             priority_factor,
             virtual_time: AtomicU64::new(self.last_min_vt.load(Ordering::Acquire)),
         });
-        self.resource_groups.insert(id, group);
+        self.resource_groups.insert(name, group)
     }
 
-    pub fn remove_resource_group(&self, id: u64) -> Option<Arc<ResourceGroup>> {
-        self.resource_groups.remove(&id).map(|kv| kv.1)
+    pub fn remove_resource_group(&self, name: &str) -> Option<Arc<ResourceGroup>> {
+        if name == "default" {
+            self.init_default_group()
+        } else {
+            self.resource_groups.remove(name).map(|kv| kv.1)
+        }
     }
 
     pub fn get_all_resource_groups(&self) -> Vec<ResourceGroupConfig> {
@@ -95,10 +98,10 @@ impl ResourceController {
     }
 
     #[inline]
-    fn resource_group(&self, group_id: u64) -> Ref<u64, Arc<ResourceGroup>> {
+    fn resource_group(&self, name: &str) -> Ref<String, Arc<ResourceGroup>> {
         self.resource_groups
-            .get(&group_id)
-            .unwrap_or_else(|| self.resource_groups.get(&0).unwrap())
+            .get(name)
+            .unwrap_or_else(|| self.resource_groups.get("default").unwrap())
 
         // if let Some(group) = self.resource_groups.get(&group_id) {
         //     return group;
@@ -114,12 +117,12 @@ impl ResourceController {
         // self.resource_groups.get(&group_id).unwrap()
     }
 
-    pub fn get_priority(&self, group_id: u64, priority: CommandPri) -> u64 {
-        self.resource_group(group_id).get_priority(priority)
+    pub fn get_priority(&self, name: &str, priority: CommandPri) -> u64 {
+        self.resource_group(name).get_priority(priority)
     }
 
-    pub fn consume(&self, group_id: u64, cpu_duration: Duration) {
-        self.resource_group(group_id).consume(cpu_duration)
+    pub fn consume(&self, name: &str, cpu_duration: Duration) {
+        self.resource_group(name).consume(cpu_duration)
     }
 
     pub fn maybe_update_min_virtual_time(&self) {
@@ -152,7 +155,7 @@ impl ResourceController {
         self.resource_groups.iter().for_each(|g| {
             let vt = g.current_vt();
             GROUP_PRIORITY
-                .with_label_values(&[&format!("{}", g.config.id)])
+                .with_label_values(&[&format!("{}", g.config.name)])
                 .set(vt as f64);
             if min_vt > vt {
                 min_vt = vt;
@@ -227,6 +230,7 @@ impl ResourceGroup {
             .fetch_add(base_priority_delta, Ordering::Relaxed)
             + base_priority_delta
             + task_extra_priority
+        // self.virtual_time.load(Ordering::Relaxed) + task_extra_priority
     }
 
     #[inline]
@@ -251,7 +255,7 @@ pub struct ControlledFuture<F> {
     #[pin]
     future: F,
     controller: Arc<ResourceController>,
-    group_id: u64,
+    group_name: String,
     priority: CommandPri,
 }
 
@@ -259,13 +263,13 @@ impl<F> ControlledFuture<F> {
     pub fn new(
         future: F,
         controller: Arc<ResourceController>,
-        group_id: u64,
+        group_name: String,
         priority: CommandPri,
     ) -> Self {
         Self {
             future,
             controller,
-            group_id,
+            group_name,
             priority,
         }
     }
@@ -279,16 +283,14 @@ impl<F: Future> Future for ControlledFuture<F> {
         let now = Instant::now();
         let res = this.future.poll(cx);
         this.controller
-            .consume(*this.group_id, now.saturating_elapsed());
+            .consume(this.group_name, now.saturating_elapsed());
         if res.is_pending() {
-            set_task_priority(this.controller.get_priority(*this.group_id, *this.priority));
+            set_task_priority(
+                this.controller
+                    .get_priority(this.group_name, *this.priority),
+            );
         }
         this.controller.maybe_update_min_virtual_time();
         res
     }
-}
-
-pub fn parse_resource_group_tag(mut data: &[u8]) -> u64 {
-    // return the default resource_group if meets error
-    data.read_u64::<BigEndian>().unwrap_or(0)
 }
