@@ -9,6 +9,7 @@ use std::{
 use grpcio::EnvBuilder;
 use kvproto::metapb::*;
 use pd_client::{PdClient, RegionInfo, RegionStat, RpcClient};
+use resource_control::ResourceGroupConfig;
 use security::{SecurityConfig, SecurityManager};
 use test_pd::{mocker::*, util::*, Server as MockServer};
 use tikv_util::config::ReadableDuration;
@@ -73,7 +74,7 @@ fn test_pd_client_deadlock() {
         request!(client => block_on(get_store_stats_async(0))),
         request!(client => get_operator(0)),
         request!(client => block_on(get_tso())),
-        request!(client => load_global_config(vec![])),
+        request!(client => load_global_config(String::default())),
     ];
 
     for (name, func) in test_funcs {
@@ -109,44 +110,33 @@ fn test_pd_client_deadlock() {
 fn test_load_global_config() {
     let (mut _server, client) = new_test_server_and_client(ReadableDuration::millis(100));
     let res = futures::executor::block_on(async move {
-        client
-            .load_global_config(
-                ["abc", "123", "xyz"]
-                    .iter()
-                    .map(|x| x.to_string())
-                    .collect::<Vec<_>>(),
-            )
-            .await
-    });
-    for (k, v) in res.unwrap() {
-        assert_eq!(k, format!("/global/config/{}", v))
+        client.load_global_config(String::from("global")).await
+    })
+    .unwrap();
+    for item in res {
+        assert_eq!(item.get_name(), "global".to_string());
+        assert_eq!(item.get_value(), "load_global_config".to_string());
     }
 }
 
 #[test]
-fn test_watch_global_config_on_closed_server() {
+fn test_watch_resource_group_config_on_closed_server() {
     let (mut server, client) = new_test_server_and_client(ReadableDuration::millis(100));
     let client = Arc::new(client);
     use futures::StreamExt;
     let j = std::thread::spawn(move || {
         futures::executor::block_on(async move {
-            let mut r = client.watch_global_config().unwrap();
-            let mut i: usize = 0;
+            let mut r = client.watch_global_config("global".into()).unwrap();
+            let mut i: u64 = 1;
             while let Some(r) = r.next().await {
                 match r {
                     Ok(res) => {
                         let change = &res.get_changes()[0];
-                        assert_eq!(
-                            change
-                                .get_name()
-                                .split('/')
-                                .collect::<Vec<_>>()
-                                .last()
-                                .unwrap()
-                                .to_owned(),
-                            format!("{:?}", i)
-                        );
-                        assert_eq!(change.get_value().to_owned(), format!("{:?}", i));
+                        assert_eq!(change.get_name(), "global");
+                        let config =
+                            serde_json::from_str::<ResourceGroupConfig>(change.get_value())
+                                .unwrap();
+                        assert_eq!(config.get_id(), i);
                         i += 1;
                     }
                     Err(e) => {

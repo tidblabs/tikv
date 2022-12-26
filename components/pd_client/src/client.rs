@@ -1,7 +1,6 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
-    collections::HashMap,
     fmt,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -22,7 +21,7 @@ use futures::{
 use grpcio::{EnvBuilder, Environment, WriteFlags};
 use kvproto::{
     metapb,
-    pdpb::{self, Member},
+    pdpb::{self, GlobalConfigItem, Member},
     replication_modepb::{RegionReplicationStatus, ReplicationStatus, StoreDrAutoSyncStatus},
 };
 use security::SecurityManager;
@@ -286,10 +285,40 @@ impl fmt::Debug for RpcClient {
 const LEADER_CHANGE_RETRY: usize = 10;
 
 impl PdClient for RpcClient {
-    fn load_global_config(&self, list: Vec<String>) -> PdFuture<HashMap<String, String>> {
+    fn store_global_config(&self, config_path: String, items: &[GlobalConfigItem]) -> PdFuture<()> {
+        use kvproto::pdpb::StoreGlobalConfigRequest;
+        let mut req = StoreGlobalConfigRequest::new();
+        req.set_config_path(config_path);
+        req.set_changes(items.into());
+
+        let executor = move |client: &Client, req: pdpb::StoreGlobalConfigRequest| {
+            let handler = {
+                let inner = client.inner.rl();
+                inner
+                    .client_stub
+                    .store_global_config_async_opt(&req, call_option_inner(&inner))
+                    .unwrap_or_else(|e| {
+                        panic!("fail to request PD {} err {:?}", "report_batch_split", e)
+                    })
+            };
+
+            Box::pin(async move {
+                match handler.await {
+                    Ok(_) => Ok(()),
+                    Err(err) => Err(box_err!("{:?}", err)),
+                }
+            }) as PdFuture<_>
+        };
+
+        self.pd_client
+            .request(req, executor, LEADER_CHANGE_RETRY)
+            .execute()
+    }
+
+    fn load_global_config(&self, config_path: String) -> PdFuture<Vec<GlobalConfigItem>> {
         use kvproto::pdpb::LoadGlobalConfigRequest;
         let mut req = LoadGlobalConfigRequest::new();
-        req.set_names(list.into());
+        req.set_config_path(config_path);
         let executor = |client: &Client, req| match client
             .inner
             .rl()
@@ -300,12 +329,15 @@ impl PdClient for RpcClient {
             Ok(grpc_response) => Box::pin(async move {
                 match grpc_response.await {
                     Ok(grpc_response) => {
-                        let mut res = HashMap::with_capacity(grpc_response.get_items().len());
+                        let mut res = Vec::with_capacity(grpc_response.get_items().len());
                         for c in grpc_response.get_items() {
                             if c.has_error() {
                                 error!("failed to load global config with key {:?}", c.get_error());
                             } else {
-                                res.insert(c.get_name().to_owned(), c.get_value().to_owned());
+                                let mut item = GlobalConfigItem::default();
+                                item.set_name(c.get_name().to_string());
+                                item.set_value(c.get_value().to_string());
+                                res.push(item);
                             }
                         }
                         Ok(res)
@@ -322,9 +354,11 @@ impl PdClient for RpcClient {
 
     fn watch_global_config(
         &self,
+        config_path: String,
     ) -> Result<grpcio::ClientSStreamReceiver<pdpb::WatchGlobalConfigResponse>> {
         use kvproto::pdpb::WatchGlobalConfigRequest;
-        let req = WatchGlobalConfigRequest::default();
+        let mut req = WatchGlobalConfigRequest::default();
+        req.set_config_path(config_path);
         sync_request(&self.pd_client, LEADER_CHANGE_RETRY, |client, _| {
             client.watch_global_config(&req)
         })

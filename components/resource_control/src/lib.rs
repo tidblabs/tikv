@@ -9,16 +9,27 @@ use std::{
         Arc,
     },
     task::{Context, Poll},
+    thread,
     time::Duration,
 };
 
 use dashmap::{mapref::one::Ref, DashMap};
-use kvproto::kvrpcpb::CommandPri;
+use futures::{executor::block_on, StreamExt};
+use kvproto::{
+    kvrpcpb::CommandPri,
+    pdpb::{self, GlobalConfigItem},
+};
 use lazy_static::lazy_static;
+use pd_client::PdClient;
 use pin_project::pin_project;
 use prometheus::*;
 use serde::{Deserialize, Serialize};
-use tikv_util::{sys::SysQuota, time::Instant};
+use tikv_util::{
+    error, info,
+    sys::{thread::StdThreadBuildWrapper, SysQuota},
+    time::Instant,
+};
+use tokio::sync::mpsc;
 use yatp::queue::priority::set_task_priority;
 
 const DEFAULT_PRIORITY_PER_TASK: u64 = 100; // a task cost at least 100us.
@@ -35,6 +46,8 @@ lazy_static! {
     .unwrap();
 }
 
+pub const CONFIG_PATH: &str = "resource_group";
+
 pub struct ResourceController {
     resource_groups: DashMap<String, Arc<ResourceGroup>>,
     total_cpu_quota: f64,
@@ -42,10 +55,33 @@ pub struct ResourceController {
     start_ts: Instant,
     // the value is the duration delta(in ms) from start_ts
     last_vt_update_time: AtomicU64,
+    pd_client: Arc<dyn PdClient>,
+}
+
+pub async fn watch_resource_group(
+    mut rpc_receiver: grpcio::ClientSStreamReceiver<pdpb::WatchGlobalConfigResponse>,
+    request_tx: mpsc::Sender<ResourceGroupConfig>,
+) {
+    while let Some(Ok(r)) = rpc_receiver.next().await {
+        let change = r.get_changes();
+        for item in change {
+            match serde_json::from_str::<ResourceGroupConfig>(item.get_value()) {
+                Ok(config) => {
+                    if let Err(e) = request_tx.try_send(config) {
+                        info!("watcher worker terminated by send err"; "err is: " => ?e);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    error!("failed to watch deserialize config json, err: {}", e);
+                }
+            }
+        }
+    }
 }
 
 impl ResourceController {
-    pub fn new() -> Self {
+    pub fn new(pd_client: Arc<dyn PdClient>) -> Self {
         let total_cpu_quota = SysQuota::cpu_cores_quota() * 1000.0;
         let r = Self {
             resource_groups: DashMap::new(),
@@ -53,9 +89,33 @@ impl ResourceController {
             last_min_vt: AtomicU64::new(0),
             start_ts: Instant::now_coarse(),
             last_vt_update_time: AtomicU64::new(0),
+            pd_client: pd_client.clone(),
         };
-        r.init_default_group();
+        let old_cfgs = r.load_global_config();
+        if old_cfgs.is_empty() {
+            r.init_default_group();
+            r.store_global_config();
+        }
+        r.start_watch();
         r
+    }
+
+    fn start_watch(&self) {
+        let stream = self
+            .pd_client
+            .watch_global_config(CONFIG_PATH.to_string())
+            .unwrap();
+        let (request_tx, mut request_rx) = mpsc::channel(20);
+        // Start a background thread to handle watcher machanism
+        let handler = thread::Builder::new()
+            .name("watcher-worker".into())
+            .spawn_wrapper(move || block_on(watch_resource_group(stream, request_tx)))
+            .expect("unable to create watcher worker thread");
+
+        while let Some(cfg) = block_on(request_rx.recv()) {
+            self.add_resource_group(cfg);
+        }
+        handler.join().unwrap();
     }
 
     fn init_default_group(&self) -> Option<Arc<ResourceGroup>> {
@@ -69,6 +129,49 @@ impl ResourceController {
             write_bandwidth: 0,
         };
         self.add_resource_group(default_group_cfg)
+    }
+
+    pub fn store_global_config(&self) {
+        let items: &[GlobalConfigItem] = &self
+            .get_all_resource_groups()
+            .into_iter()
+            .map(|cfg| {
+                let mut item = GlobalConfigItem::default();
+                item.set_name(cfg.name.clone());
+                item.set_value(serde_json::to_string(&cfg).unwrap());
+                item
+            })
+            .collect::<Vec<_>>();
+
+        block_on(async move {
+            self.pd_client
+                .store_global_config(CONFIG_PATH.to_string(), items)
+                .await
+        })
+        .unwrap();
+    }
+
+    pub fn load_global_config(&self) -> Vec<ResourceGroupConfig> {
+        let items = block_on(async move {
+            self.pd_client
+                .load_global_config(CONFIG_PATH.to_string())
+                .await
+        })
+        .unwrap();
+
+        let mut res = Vec::new();
+        for item in items {
+            match serde_json::from_str::<ResourceGroupConfig>(item.get_value()) {
+                Ok(config) => {
+                    res.push(config.clone());
+                    self.add_resource_group(config);
+                }
+                Err(e) => {
+                    error!("failed to load deserialize config json, err: {:?}", e);
+                }
+            }
+        }
+        res
     }
 
     pub fn add_resource_group(&self, config: ResourceGroupConfig) -> Option<Arc<ResourceGroup>> {
@@ -183,7 +286,7 @@ impl ResourceController {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "kebab-case")]
 pub struct ResourceGroupConfig {
     id: u64,
@@ -208,6 +311,10 @@ impl ResourceGroupConfig {
             read_bandwidth,
             write_bandwidth,
         }
+    }
+
+    pub fn get_id(&self) -> u64 {
+        self.id
     }
 }
 
@@ -292,5 +399,34 @@ impl<F: Future> Future for ControlledFuture<F> {
         }
         this.controller.maybe_update_min_virtual_time();
         res
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use pd_client::RpcClient;
+    use test_pd::{mocker::Service, util::*, Server as MockServer};
+    use tikv_util::config::ReadableDuration;
+
+    fn new_test_server_and_client(
+        update_interval: ReadableDuration,
+    ) -> (MockServer<Service>, RpcClient) {
+        let server = MockServer::new(1);
+        let eps = server.bind_addrs();
+        let client = new_client_with_update_interval(eps, None, update_interval);
+        (server, client)
+    }
+
+    use super::*;
+    #[test]
+    fn watch_config_test() {
+        let (mut server, client) = new_test_server_and_client(ReadableDuration::millis(100));
+        let rctl = ResourceController::new(Arc::new(client));
+        rctl.start_watch();
+        rctl.store_global_config();
+
+        assert_eq!(rctl.get_all_resource_groups().len(), 101);
+        server.stop();
+        std::fs::remove_file(CONFIG_PATH).expect("Failed to delete file");
     }
 }

@@ -10,12 +10,13 @@ mod util;
 
 mod config;
 pub mod errors;
-use std::{cmp::Ordering, collections::HashMap, ops::Deref, sync::Arc, time::Duration};
+use std::{cmp::Ordering, ops::Deref, sync::Arc, time::Duration};
 
 use futures::future::BoxFuture;
 use grpcio::ClientSStreamReceiver;
 use kvproto::{
-    metapb, pdpb,
+    metapb,
+    pdpb::{self, GlobalConfigItem},
     replication_modepb::{RegionReplicationStatus, ReplicationStatus, StoreDrAutoSyncStatus},
 };
 use pdpb::{QueryStats, WatchGlobalConfigResponse};
@@ -204,17 +205,24 @@ pub const INVALID_ID: u64 = 0;
 /// all the time.
 pub trait PdClient: Send + Sync {
     /// Load a list of GlobalConfig
-    fn load_global_config(&self, _list: Vec<String>) -> PdFuture<HashMap<String, String>> {
+    fn load_global_config(&self, _config_path: String) -> PdFuture<Vec<GlobalConfigItem>> {
         unimplemented!();
     }
 
     /// Store a list of GlobalConfig
-    fn store_global_config(&self, _list: HashMap<String, String>) -> PdFuture<()> {
+    fn store_global_config(
+        &self,
+        _config_path: String,
+        _items: &[GlobalConfigItem],
+    ) -> PdFuture<()> {
         unimplemented!();
     }
 
     /// Watching change of GlobalConfig
-    fn watch_global_config(&self) -> Result<ClientSStreamReceiver<WatchGlobalConfigResponse>> {
+    fn watch_global_config(
+        &self,
+        _config_path: String,
+    ) -> Result<ClientSStreamReceiver<WatchGlobalConfigResponse>> {
         unimplemented!();
     }
 

@@ -42,6 +42,7 @@ use raftstore::{
     },
     Result,
 };
+use resource_control::ResourceController;
 use resource_metering::{CollectorRegHandle, ResourceTagFactory};
 use security::SecurityManager;
 use tempfile::TempDir;
@@ -516,6 +517,7 @@ impl ServerCluster {
         node.try_bootstrap_store(engines.clone())?;
         let node_id = node.id();
 
+        let resource_ctl = Arc::new(ResourceController::new(self.pd_client.clone()));
         for _ in 0..100 {
             let mut svr = Server::new(
                 node_id,
@@ -531,6 +533,7 @@ impl ServerCluster {
                 check_leader_scheduler.clone(),
                 self.env.clone(),
                 None,
+                resource_ctl.clone(),
                 debug_thread_pool.clone(),
                 health_service.clone(),
             )

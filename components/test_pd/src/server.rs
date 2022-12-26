@@ -18,6 +18,7 @@ use grpcio::{
 use kvproto::pdpb::*;
 use pd_client::Error as PdError;
 use security::*;
+use serde::{Deserialize, Serialize};
 
 use super::mocker::*;
 
@@ -182,6 +183,16 @@ impl<C: PdMocker> Clone for PdMock<C> {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub struct ResourceGroupConfig {
+    id: u64,
+    name: String,
+    cpu_quota: f64,
+    read_bandwidth: u64,
+    write_bandwidth: u64,
+}
+
 impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
     fn load_global_config(
         &mut self,
@@ -194,30 +205,40 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
 
     fn store_global_config(
         &mut self,
-        _ctx: RpcContext<'_>,
-        _req: StoreGlobalConfigRequest,
-        _sink: UnarySink<StoreGlobalConfigResponse>,
+        ctx: RpcContext<'_>,
+        req: StoreGlobalConfigRequest,
+        sink: UnarySink<StoreGlobalConfigResponse>,
     ) {
-        unimplemented!()
+        hijack_unary(self, ctx, sink, |c| c.store_global_config(&req))
     }
 
+    // now just for resource group, will remove it after review
     fn watch_global_config(
         &mut self,
         ctx: RpcContext<'_>,
-        _req: WatchGlobalConfigRequest,
+        req: WatchGlobalConfigRequest,
         mut sink: ServerStreamingSink<WatchGlobalConfigResponse>,
     ) {
         ctx.spawn(async move {
-            let mut name: usize = 0;
-            loop {
+            let mut name: u64 = 1;
+            while name <= 100 {
+                let mut config = ResourceGroupConfig {
+                    id: 1,
+                    name: "test".into(),
+                    cpu_quota: 1.0,
+                    read_bandwidth: 100,
+                    write_bandwidth: 100,
+                };
+                config.id = name;
+                config.name = format!("{} + {}", config.name, name);
+                name += 1;
                 let mut change = GlobalConfigItem::new();
-                change.set_name(format!("/global/config/{:?}", name).to_owned());
-                change.set_value(format!("{:?}", name));
+                change.set_name(req.get_config_path().to_string());
+                change.set_value(serde_json::to_string(&config).unwrap());
                 let mut wc = WatchGlobalConfigResponse::default();
                 wc.set_changes(vec![change].into());
                 // simulate network delay
                 std::thread::sleep(Duration::from_millis(10));
-                name += 1;
                 let _ = sink.send((wc, WriteFlags::default())).await;
                 let _ = sink.flush().await;
             }

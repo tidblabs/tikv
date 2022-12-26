@@ -19,7 +19,7 @@ use kvproto::{
     raft_cmdpb::RaftCmdRequest,
     raft_serverpb::PeerState,
 };
-use pd_client::{Config as PdConfig, PdClient, RpcClient};
+use pd_client::{Config as PdConfig, RpcClient};
 use protobuf::Message;
 use raft::eraftpb::{ConfChange, ConfChangeV2, Entry, EntryType};
 use raft_log_engine::RaftLogEngine;

@@ -1,7 +1,8 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::result;
+use std::{fs, result};
 
+use collections::HashMap;
 use kvproto::pdpb::*;
 
 mod bootstrap;
@@ -29,23 +30,36 @@ pub trait PdMocker {
         &self,
         req: &LoadGlobalConfigRequest,
     ) -> Option<Result<LoadGlobalConfigResponse>> {
-        let mut send = vec![];
-        for r in req.get_names() {
-            let mut i = GlobalConfigItem::default();
-            i.set_name(format!("/global/config/{}", r.clone()));
-            i.set_value(r.clone());
-            send.push(i);
-        }
         let mut res = LoadGlobalConfigResponse::default();
-        res.set_items(send.into());
+        if let Ok(contents) = fs::read_to_string(req.get_config_path()) {
+            let map: HashMap<String, String> =
+                serde_json::from_str::<HashMap<String, String>>(&contents).unwrap();
+            let items: Vec<GlobalConfigItem> = map
+                .into_iter()
+                .map(|(name, val)| {
+                    let mut item = GlobalConfigItem::default();
+                    item.set_name(name);
+                    item.set_value(val);
+                    item
+                })
+                .collect();
+
+            res.set_items(items.into());
+        }
         Some(Ok(res))
     }
 
     fn store_global_config(
         &self,
-        _: &StoreGlobalConfigRequest,
+        req: &StoreGlobalConfigRequest,
     ) -> Option<Result<StoreGlobalConfigResponse>> {
-        unimplemented!()
+        let mut map = HashMap::default();
+        for item in req.get_changes() {
+            map.insert(item.get_name().to_string(), item.get_value().to_string());
+        }
+        let contents = serde_json::to_string(&map).unwrap();
+        fs::write(req.get_config_path(), contents).unwrap();
+        Some(Ok(StoreGlobalConfigResponse::default()))
     }
 
     fn watch_global_config(&self) -> Option<Result<WatchGlobalConfigResponse>> {
