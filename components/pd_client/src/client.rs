@@ -362,11 +362,16 @@ impl PdClient for RpcClient {
         {
             Ok(mut stream) => Box::pin(async move {
                 let (request_tx, request_rx) = tikv_util::mpsc::unbounded();
-                while let Some(Ok(r)) = stream.next().await {
-                    let mut items = Vec::default();
-                    items.extend(r.get_changes().iter().cloned());
-                    if let Err(e) = request_tx.send(items) {
-                        return Err(box_err!("{:?}", e));
+                while let Some(grpc_response) = stream.next().await {
+                    match grpc_response {
+                        Ok(r) => {
+                            let mut items = Vec::default();
+                            items.extend(r.get_changes().iter().cloned());
+                            if let Err(e) = request_tx.send(items) {
+                                return Err(box_err!("{:?}", e));
+                            }
+                        }
+                        Err(err) => return Err(box_err!("{:?}", err)),
                     }
                 }
                 Ok(request_rx)

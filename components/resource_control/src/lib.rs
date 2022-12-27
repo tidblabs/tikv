@@ -63,7 +63,6 @@ impl ResourceController {
         let old_cfgs = r.load_global_config();
         if old_cfgs.is_empty() {
             r.init_default_group();
-            r.store_global_config();
         }
         r.start_watcher();
         r
