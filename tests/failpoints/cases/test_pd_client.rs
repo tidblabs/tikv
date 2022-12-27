@@ -123,38 +123,27 @@ fn test_load_global_config() {
 fn test_watch_resource_group_config_on_closed_server() {
     let (mut server, client) = new_test_server_and_client(ReadableDuration::millis(100));
     let client = Arc::new(client);
-    use futures::StreamExt;
-    let j = std::thread::spawn(move || {
-        futures::executor::block_on(async move {
-            let mut r = client.watch_global_config("global".into()).unwrap();
-            let mut i: u64 = 1;
-            while let Some(r) = r.next().await {
-                match r {
-                    Ok(res) => {
-                        let change = &res.get_changes()[0];
-                        assert_eq!(change.get_name(), "global");
-                        let config =
-                            serde_json::from_str::<ResourceGroupConfig>(change.get_value())
-                                .unwrap();
-                        assert_eq!(config.get_id(), i);
-                        i += 1;
-                    }
-                    Err(e) => {
-                        if let grpcio::Error::RpcFailure(e) = e {
-                            // 14-UNAVAILABLE
-                            assert_eq!(e.code(), grpcio::RpcStatusCode::from(14));
-                            break;
-                        } else {
-                            panic!("other error occur {:?}", e)
-                        }
-                    }
+    let watcher =
+        futures::executor::block_on(
+            async move { client.watch_global_config("global".into()).await },
+        )
+        .unwrap();
+    let mut i: u64 = 1;
+    while let Ok(items) = watcher.recv() {
+        for item in items {
+            match serde_json::from_str::<ResourceGroupConfig>(item.get_value()) {
+                Ok(cfg) => {
+                    assert_eq!(cfg.get_id(), i);
+                    i += 1;
+                }
+                Err(e) => {
+                    error!("failed to watch deserialize config json, err: {}", e);
                 }
             }
-        });
-    });
+        }
+    }
     thread::sleep(Duration::from_millis(200));
     server.stop();
-    j.join().unwrap();
 }
 
 // Updating pd leader may be slow, we need to make sure it does not block other

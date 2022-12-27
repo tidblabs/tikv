@@ -9,27 +9,18 @@ use std::{
         Arc,
     },
     task::{Context, Poll},
-    thread,
     time::Duration,
 };
 
 use dashmap::{mapref::one::Ref, DashMap};
-use futures::{executor::block_on, StreamExt};
-use kvproto::{
-    kvrpcpb::CommandPri,
-    pdpb::{self, GlobalConfigItem},
-};
+use futures::executor::block_on;
+use kvproto::{kvrpcpb::CommandPri, pdpb::GlobalConfigItem};
 use lazy_static::lazy_static;
 use pd_client::PdClient;
 use pin_project::pin_project;
 use prometheus::*;
 use serde::{Deserialize, Serialize};
-use tikv_util::{
-    error, info,
-    sys::{thread::StdThreadBuildWrapper, SysQuota},
-    time::Instant,
-};
-use tokio::sync::mpsc;
+use tikv_util::{error, sys::SysQuota, time::Instant};
 use yatp::queue::priority::set_task_priority;
 
 const DEFAULT_PRIORITY_PER_TASK: u64 = 100; // a task cost at least 100us.
@@ -58,28 +49,6 @@ pub struct ResourceController {
     pd_client: Arc<dyn PdClient>,
 }
 
-pub async fn watch_resource_group(
-    mut rpc_receiver: grpcio::ClientSStreamReceiver<pdpb::WatchGlobalConfigResponse>,
-    request_tx: mpsc::Sender<ResourceGroupConfig>,
-) {
-    while let Some(Ok(r)) = rpc_receiver.next().await {
-        let change = r.get_changes();
-        for item in change {
-            match serde_json::from_str::<ResourceGroupConfig>(item.get_value()) {
-                Ok(config) => {
-                    if let Err(e) = request_tx.try_send(config) {
-                        info!("watcher worker terminated by send err"; "err is: " => ?e);
-                        return;
-                    }
-                }
-                Err(e) => {
-                    error!("failed to watch deserialize config json, err: {}", e);
-                }
-            }
-        }
-    }
-}
-
 impl ResourceController {
     pub fn new(pd_client: Arc<dyn PdClient>) -> Self {
         let total_cpu_quota = SysQuota::cpu_cores_quota() * 1000.0;
@@ -96,26 +65,31 @@ impl ResourceController {
             r.init_default_group();
             r.store_global_config();
         }
-        r.start_watch();
+        r.start_watcher();
         r
     }
 
-    fn start_watch(&self) {
-        let stream = self
-            .pd_client
-            .watch_global_config(CONFIG_PATH.to_string())
-            .unwrap();
-        let (request_tx, mut request_rx) = mpsc::channel(20);
-        // Start a background thread to handle watcher machanism
-        let handler = thread::Builder::new()
-            .name("watcher-worker".into())
-            .spawn_wrapper(move || block_on(watch_resource_group(stream, request_tx)))
-            .expect("unable to create watcher worker thread");
+    fn start_watcher(&self) {
+        let watcher = block_on(async move {
+            self.pd_client
+                .clone()
+                .watch_global_config(CONFIG_PATH.to_string())
+                .await
+        })
+        .unwrap();
 
-        while let Some(cfg) = block_on(request_rx.recv()) {
-            self.add_resource_group(cfg);
+        while let Ok(items) = watcher.recv() {
+            for item in items {
+                match serde_json::from_str::<ResourceGroupConfig>(item.get_value()) {
+                    Ok(cfg) => {
+                        self.add_resource_group(cfg);
+                    }
+                    Err(e) => {
+                        error!("failed to watch deserialize config json, err: {}", e);
+                    }
+                }
+            }
         }
-        handler.join().unwrap();
     }
 
     fn init_default_group(&self) -> Option<Arc<ResourceGroup>> {
@@ -422,7 +396,7 @@ pub mod tests {
     fn watch_config_test() {
         let (mut server, client) = new_test_server_and_client(ReadableDuration::millis(100));
         let rctl = ResourceController::new(Arc::new(client));
-        rctl.start_watch();
+        rctl.start_watcher();
         rctl.store_global_config();
 
         assert_eq!(rctl.get_all_resource_groups().len(), 101);

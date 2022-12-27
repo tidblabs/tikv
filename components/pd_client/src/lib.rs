@@ -13,13 +13,12 @@ pub mod errors;
 use std::{cmp::Ordering, ops::Deref, sync::Arc, time::Duration};
 
 use futures::future::BoxFuture;
-use grpcio::ClientSStreamReceiver;
 use kvproto::{
     metapb,
     pdpb::{self, GlobalConfigItem},
     replication_modepb::{RegionReplicationStatus, ReplicationStatus, StoreDrAutoSyncStatus},
 };
-use pdpb::{QueryStats, WatchGlobalConfigResponse};
+use pdpb::QueryStats;
 use tikv_util::time::{Instant, UnixSecs};
 use txn_types::TimeStamp;
 
@@ -222,7 +221,7 @@ pub trait PdClient: Send + Sync {
     fn watch_global_config(
         &self,
         _config_path: String,
-    ) -> Result<ClientSStreamReceiver<WatchGlobalConfigResponse>> {
+    ) -> PdFuture<tikv_util::mpsc::Receiver<Vec<GlobalConfigItem>>> {
         unimplemented!();
     }
 

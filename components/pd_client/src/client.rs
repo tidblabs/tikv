@@ -290,26 +290,20 @@ impl PdClient for RpcClient {
         let mut req = StoreGlobalConfigRequest::new();
         req.set_config_path(config_path);
         req.set_changes(items.into());
-
-        let executor = move |client: &Client, req: pdpb::StoreGlobalConfigRequest| {
-            let handler = {
-                let inner = client.inner.rl();
-                inner
-                    .client_stub
-                    .store_global_config_async_opt(&req, call_option_inner(&inner))
-                    .unwrap_or_else(|e| {
-                        panic!("fail to request PD {} err {:?}", "report_batch_split", e)
-                    })
-            };
-
-            Box::pin(async move {
-                match handler.await {
-                    Ok(_) => Ok(()),
-                    Err(err) => Err(box_err!("{:?}", err)),
+        let executor = move |client: &Client, req: pdpb::StoreGlobalConfigRequest| match client
+            .inner
+            .rl()
+            .client_stub
+            .store_global_config_async(&req)
+        {
+            Ok(grpc_response) => Box::pin(async move {
+                if let Err(err) = grpc_response.await {
+                    return Err(box_err!("{:?}", err));
                 }
-            }) as PdFuture<_>
+                Ok(())
+            }) as PdFuture<_>,
+            Err(err) => Box::pin(async move { Err(box_err!("{:?}", err)) }) as PdFuture<_>,
         };
-
         self.pd_client
             .request(req, executor, LEADER_CHANGE_RETRY)
             .execute()
@@ -355,13 +349,33 @@ impl PdClient for RpcClient {
     fn watch_global_config(
         &self,
         config_path: String,
-    ) -> Result<grpcio::ClientSStreamReceiver<pdpb::WatchGlobalConfigResponse>> {
+    ) -> PdFuture<tikv_util::mpsc::Receiver<Vec<GlobalConfigItem>>> {
         use kvproto::pdpb::WatchGlobalConfigRequest;
         let mut req = WatchGlobalConfigRequest::default();
         req.set_config_path(config_path);
-        sync_request(&self.pd_client, LEADER_CHANGE_RETRY, |client, _| {
-            client.watch_global_config(&req)
-        })
+        let executor = |client: &Client, req| match client
+            .inner
+            .rl()
+            .client_stub
+            .clone()
+            .watch_global_config(&req)
+        {
+            Ok(mut stream) => Box::pin(async move {
+                let (request_tx, request_rx) = tikv_util::mpsc::unbounded();
+                while let Some(Ok(r)) = stream.next().await {
+                    let mut items = Vec::default();
+                    items.extend(r.get_changes().iter().cloned());
+                    if let Err(e) = request_tx.send(items) {
+                        return Err(box_err!("{:?}", e));
+                    }
+                }
+                Ok(request_rx)
+            }) as PdFuture<_>,
+            Err(err) => Box::pin(async move { Err(box_err!("{:?}", err)) }) as PdFuture<_>,
+        };
+        self.pd_client
+            .request(req, executor, LEADER_CHANGE_RETRY)
+            .execute()
     }
 
     fn get_cluster_id(&self) -> Result<u64> {

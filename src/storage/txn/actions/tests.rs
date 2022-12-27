@@ -116,7 +116,7 @@ pub fn must_prewrite_put_impl_with_should_not_exist<E: Engine>(
     txn_source: u32,
 ) {
     let mut ctx = Context::default();
-    ctx.set_txn_source(txn_source);
+    ctx.set_txn_source(txn_source.into());
     if let Some(region_id) = region_id {
         ctx.region_id = region_id;
     }
