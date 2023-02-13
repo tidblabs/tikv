@@ -4,7 +4,6 @@
 mod profile;
 use std::{
     error::Error as StdError,
-    marker::PhantomData,
     net::SocketAddr,
     path::PathBuf,
     pin::Pin,
@@ -16,7 +15,6 @@ use std::{
 
 use async_stream::stream;
 use collections::HashMap;
-use engine_traits::KvEngine;
 use flate2::{write::GzEncoder, Compression};
 use futures::{
     compat::{Compat01As03, Stream01CompatExt},
@@ -45,11 +43,10 @@ pub use profile::{
     read_file, start_one_cpu_profile, start_one_heap_profile,
 };
 use prometheus::TEXT_FORMAT;
-use raftstore::store::{transport::CasualRouter, CasualMessage};
 use regex::Regex;
-use resource_control::ResourceController;
 use security::{self, SecurityConfig};
 use serde_json::Value;
+use tikv_kv::RaftExtension;
 use tikv_util::{
     logger::set_log_level,
     metrics::{dump, dump_to},
@@ -83,28 +80,24 @@ struct LogLevelRequest {
     pub log_level: LogLevel,
 }
 
-pub struct StatusServer<E, R> {
+pub struct StatusServer<R> {
     thread_pool: Runtime,
     tx: Sender<()>,
     rx: Option<Receiver<()>>,
     addr: Option<SocketAddr>,
     cfg_controller: ConfigController,
-    resource_ctl: Arc<ResourceController>,
     router: R,
     security_config: Arc<SecurityConfig>,
     store_path: PathBuf,
-    _snap: PhantomData<E>,
 }
 
-impl<E, R> StatusServer<E, R>
+impl<R> StatusServer<R>
 where
-    E: 'static,
     R: 'static + Send,
 {
     pub fn new(
         status_thread_pool_size: usize,
         cfg_controller: ConfigController,
-        resource_ctl: Arc<ResourceController>,
         security_config: Arc<SecurityConfig>,
         router: R,
         store_path: PathBuf,
@@ -124,11 +117,9 @@ where
             rx: Some(rx),
             addr: None,
             cfg_controller,
-            resource_ctl,
             router,
             security_config,
             store_path,
-            _snap: PhantomData,
         })
     }
 
@@ -414,55 +405,6 @@ where
         }
     }
 
-    async fn update_resource_group(
-        req: Request<Body>,
-        resource_ctl: &ResourceController,
-    ) -> hyper::Result<Response<Body>> {
-        let mut body = Vec::new();
-        req.into_body()
-            .try_for_each(|bytes| {
-                body.extend(bytes);
-                ok(())
-            })
-            .await?;
-        match serde_json::from_slice(&body) {
-            Ok(rg) => {
-                resource_ctl.add_resource_group(rg);
-                let mut resp = Response::default();
-                *resp.status_mut() = StatusCode::OK;
-                Ok(resp)
-            }
-            Err(e) => Ok(make_response(
-                StatusCode::BAD_REQUEST,
-                format!("failed to decode resource group, error: {:?}", e),
-            )),
-        }
-    }
-
-    async fn delete_resource_group(
-        group_name: &str,
-        resource_ctl: &ResourceController,
-    ) -> hyper::Result<Response<Body>> {
-        let mut resp = Response::default();
-        if resource_ctl.remove_resource_group(group_name).is_some() {
-            *resp.status_mut() = StatusCode::OK;
-        } else {
-            *resp.status_mut() = StatusCode::NOT_FOUND;
-        }
-        Ok(resp)
-    }
-
-    async fn get_all_resource_groups(
-        resource_ctl: &ResourceController,
-    ) -> hyper::Result<Response<Body>> {
-        let groups = resource_ctl.get_all_resource_groups();
-        let res = serde_json::to_string(&groups).unwrap();
-        Ok(Response::builder()
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(res))
-            .unwrap())
-    }
-
     pub fn stop(self) {
         let _ = self.tx.send(());
         self.thread_pool.shutdown_timeout(Duration::from_secs(3));
@@ -476,10 +418,9 @@ where
     }
 }
 
-impl<E, R> StatusServer<E, R>
+impl<R> StatusServer<R>
 where
-    E: KvEngine,
-    R: 'static + Send + CasualRouter<E> + Clone,
+    R: 'static + Send + RaftExtension + Clone,
 {
     pub async fn dump_region_meta(req: Request<Body>, router: R) -> hyper::Result<Response<Body>> {
         lazy_static! {
@@ -504,33 +445,18 @@ where
                 ));
             }
         };
-        let (tx, rx) = oneshot::channel();
-        match router.send(
-            id,
-            CasualMessage::AccessPeer(Box::new(move |meta| {
-                if let Err(meta) = tx.send(meta) {
-                    error!("receiver dropped, region meta: {:?}", meta)
-                }
-            })),
-        ) {
-            Ok(_) => (),
-            Err(raftstore::Error::RegionNotFound(_)) => {
+        let f = router.query_region(id);
+        let meta = match f.await {
+            Ok(meta) => meta,
+            Err(tikv_kv::Error(box tikv_kv::ErrorInner::Request(header)))
+                if header.has_region_not_found() =>
+            {
                 return not_found(format!("region({}) not found", id));
             }
             Err(err) => {
                 return Ok(make_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("channel pending or disconnect: {}", err),
-                ));
-            }
-        }
-
-        let meta = match rx.await {
-            Ok(meta) => meta,
-            Err(_) => {
-                return Ok(make_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "query cancelled",
+                    format!("query failed: {}", err),
                 ));
             }
         };
@@ -590,7 +516,6 @@ where
     {
         let security_config = self.security_config.clone();
         let cfg_controller = self.cfg_controller.clone();
-        let resource_ctl = self.resource_ctl.clone();
         let router = self.router.clone();
         let store_path = self.store_path.clone();
         // Start to serve.
@@ -600,7 +525,6 @@ where
             let cfg_controller = cfg_controller.clone();
             let router = router.clone();
             let store_path = store_path.clone();
-            let resource_ctl = resource_ctl.clone();
             async move {
                 // Create a status service.
                 Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
@@ -609,7 +533,6 @@ where
                     let cfg_controller = cfg_controller.clone();
                     let router = router.clone();
                     let store_path = store_path.clone();
-                    let resource_ctl = resource_ctl.clone();
                     async move {
                         let path = req.uri().path().to_owned();
                         let method = req.method().to_owned();
@@ -684,16 +607,6 @@ where
                             (Method::PUT, path) if path.starts_with("/log-level") => {
                                 Self::change_log_level(req).await
                             }
-                            (Method::GET, "/resource_groups") => {
-                                Self::get_all_resource_groups(&*resource_ctl).await
-                            }
-                            (Method::POST, "/resource_group") => {
-                                Self::update_resource_group(req, &*resource_ctl).await
-                            }
-                            (Method::DELETE, path) if path.starts_with("/resource_group/") => {
-                                Self::delete_resource_group(&path[16..], &*resource_ctl).await
-                            }
-
                             _ => Ok(make_response(StatusCode::NOT_FOUND, "path not found")),
                         }
                     }
@@ -1004,18 +917,22 @@ mod tests {
     use std::{env, io::Read, path::PathBuf, sync::Arc};
 
     use collections::HashSet;
-    use engine_test::kv::KvTestEngine;
     use flate2::read::GzDecoder;
-    use futures::{executor::block_on, future::ok, prelude::*};
+    use futures::{
+        executor::block_on,
+        future::{ok, BoxFuture},
+        prelude::*,
+    };
     use http::header::{HeaderValue, ACCEPT_ENCODING};
     use hyper::{body::Buf, client::HttpConnector, Body, Client, Method, Request, StatusCode, Uri};
     use hyper_openssl::HttpsConnector;
     use online_config::OnlineConfig;
     use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
-    use raftstore::store::{transport::CasualRouter, CasualMessage};
+    use raftstore::store::region_meta::RegionMeta;
     use security::SecurityConfig;
     use test_util::new_security_cfg;
-    use tikv_util::{config::ReadableSize, logger::get_log_level};
+    use tikv_kv::RaftExtension;
+    use tikv_util::logger::get_log_level;
 
     use crate::{
         config::{ConfigController, TikvConfig},
@@ -1025,9 +942,9 @@ mod tests {
     #[derive(Clone)]
     struct MockRouter;
 
-    impl CasualRouter<KvTestEngine> for MockRouter {
-        fn send(&self, region_id: u64, _: CasualMessage<KvTestEngine>) -> raftstore::Result<()> {
-            Err(raftstore::Error::RegionNotFound(region_id))
+    impl RaftExtension for MockRouter {
+        fn query_region(&self, region_id: u64) -> BoxFuture<'static, tikv_kv::Result<RegionMeta>> {
+            Box::pin(async move { Err(raftstore::Error::RegionNotFound(region_id).into()) })
         }
     }
 
@@ -1557,245 +1474,6 @@ mod tests {
                 .unwrap()
         });
         block_on(handle).unwrap();
-        status_server.stop();
-    }
-
-    #[test]
-    fn test_set_resource_group() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let mut status_server = StatusServer::new(
-            1,
-            ConfigController::default(),
-            Arc::new(SecurityConfig::default()),
-            MockRouter,
-            temp_dir.path().to_path_buf(),
-        )
-        .unwrap();
-        let addr = "127.0.0.1:0".to_owned();
-        let _ = status_server.start(addr);
-
-        let uri_1 = Uri::builder()
-            .scheme("http")
-            .authority(status_server.listening_addr().to_string().as_str())
-            .path_and_query("/config_resource_group")
-            .build()
-            .unwrap();
-
-        let rg_id_1: usize = 1;
-        let cpu_quota_1: usize = 1000;
-        let read_bandwidth_1 = ReadableSize::mb(10);
-        let write_bandwidth_1 = ReadableSize::kb(100);
-
-        let mut set_resource_group_request = Request::new(Body::from(
-            serde_json::to_string({
-                &ResourceGroup::new(rg_id_1, cpu_quota_1, read_bandwidth_1, write_bandwidth_1)
-            })
-            .unwrap(),
-        ));
-        *set_resource_group_request.method_mut() = Method::POST;
-        *set_resource_group_request.uri_mut() = uri_1;
-        set_resource_group_request.headers_mut().insert(
-            hyper::header::CONTENT_TYPE,
-            hyper::header::HeaderValue::from_static("application/json"),
-        );
-
-        let handle = status_server.thread_pool.spawn(async move {
-            Client::new()
-                .request(set_resource_group_request)
-                .await
-                .map(move |res| {
-                    assert_eq!(res.status(), StatusCode::OK);
-                    assert_eq!(
-                        get_resource_group(rg_id_1).unwrap().get_resource_group_id(),
-                        rg_id_1
-                    );
-                    assert_eq!(
-                        get_resource_group(rg_id_1).unwrap().get_cpu_quota(),
-                        cpu_quota_1
-                    );
-                    assert_eq!(
-                        get_resource_group(rg_id_1).unwrap().get_read_bandwidth(),
-                        read_bandwidth_1
-                    );
-                    assert_eq!(
-                        get_resource_group(rg_id_1).unwrap().get_write_bandwidth(),
-                        write_bandwidth_1
-                    );
-                })
-                .unwrap()
-        });
-        block_on(handle).unwrap();
-
-        let uri_2 = Uri::builder()
-            .scheme("http")
-            .authority(status_server.listening_addr().to_string().as_str())
-            .path_and_query("/config_resource_group")
-            .build()
-            .unwrap();
-        let rg_id_2: usize = 2;
-        let cpu_quota_2: usize = 2000;
-        let read_bandwidth_2 = ReadableSize::mb(20);
-        let write_bandwidth_2 = ReadableSize::kb(200);
-
-        let mut set_resource_group_request = Request::new(Body::from(
-            serde_json::to_string({
-                &ResourceGroup::new(rg_id_2, cpu_quota_2, read_bandwidth_2, write_bandwidth_2)
-            })
-            .unwrap(),
-        ));
-        *set_resource_group_request.method_mut() = Method::POST;
-        *set_resource_group_request.uri_mut() = uri_2;
-        set_resource_group_request.headers_mut().insert(
-            hyper::header::CONTENT_TYPE,
-            hyper::header::HeaderValue::from_static("application/json"),
-        );
-
-        let handle = status_server.thread_pool.spawn(async move {
-            Client::new()
-                .request(set_resource_group_request)
-                .await
-                .map(move |res| {
-                    assert_eq!(res.status(), StatusCode::OK);
-                    assert_eq!(
-                        get_resource_group(rg_id_1).unwrap().get_resource_group_id(),
-                        rg_id_1
-                    );
-                    assert_eq!(
-                        get_resource_group(rg_id_1).unwrap().get_cpu_quota(),
-                        cpu_quota_1
-                    );
-                    assert_eq!(
-                        get_resource_group(rg_id_1).unwrap().get_read_bandwidth(),
-                        read_bandwidth_1
-                    );
-                    assert_eq!(
-                        get_resource_group(rg_id_1).unwrap().get_write_bandwidth(),
-                        write_bandwidth_1
-                    );
-                    assert_eq!(
-                        get_resource_group(rg_id_2).unwrap().get_resource_group_id(),
-                        rg_id_2
-                    );
-                    assert_eq!(
-                        get_resource_group(rg_id_2).unwrap().get_cpu_quota(),
-                        cpu_quota_2
-                    );
-                    assert_eq!(
-                        get_resource_group(rg_id_2).unwrap().get_read_bandwidth(),
-                        read_bandwidth_2
-                    );
-                    assert_eq!(
-                        get_resource_group(rg_id_2).unwrap().get_write_bandwidth(),
-                        write_bandwidth_2
-                    );
-                })
-                .unwrap()
-        });
-        block_on(handle).unwrap();
-
-        let uri_3 = Uri::builder()
-            .scheme("http")
-            .authority(status_server.listening_addr().to_string().as_str())
-            .path_and_query("/config_resource_group")
-            .build()
-            .unwrap();
-        let rg_id_3: usize = rg_id_2;
-        let cpu_quota_3: usize = 3000;
-        let read_bandwidth_3 = ReadableSize::mb(30);
-        let write_bandwidth_3 = ReadableSize::kb(300);
-
-        let mut set_resource_group_request = Request::new(Body::from(
-            serde_json::to_string({
-                &ResourceGroup::new(rg_id_2, cpu_quota_3, read_bandwidth_3, write_bandwidth_3)
-            })
-            .unwrap(),
-        ));
-        *set_resource_group_request.method_mut() = Method::POST;
-        *set_resource_group_request.uri_mut() = uri_3;
-        set_resource_group_request.headers_mut().insert(
-            hyper::header::CONTENT_TYPE,
-            hyper::header::HeaderValue::from_static("application/json"),
-        );
-
-        let handle = status_server.thread_pool.spawn(async move {
-            Client::new()
-                .request(set_resource_group_request)
-                .await
-                .map(move |res| {
-                    assert_eq!(res.status(), StatusCode::OK);
-                    assert_eq!(
-                        get_resource_group(rg_id_1).unwrap().get_resource_group_id(),
-                        rg_id_1
-                    );
-                    assert_eq!(
-                        get_resource_group(rg_id_1).unwrap().get_cpu_quota(),
-                        cpu_quota_1
-                    );
-                    assert_eq!(
-                        get_resource_group(rg_id_1).unwrap().get_read_bandwidth(),
-                        read_bandwidth_1
-                    );
-                    assert_eq!(
-                        get_resource_group(rg_id_1).unwrap().get_write_bandwidth(),
-                        write_bandwidth_1
-                    );
-                    assert_eq!(
-                        get_resource_group(rg_id_2).unwrap().get_resource_group_id(),
-                        rg_id_3
-                    );
-                    assert_eq!(
-                        get_resource_group(rg_id_2).unwrap().get_cpu_quota(),
-                        cpu_quota_3
-                    );
-                    assert_eq!(
-                        get_resource_group(rg_id_2).unwrap().get_read_bandwidth(),
-                        read_bandwidth_3
-                    );
-                    assert_eq!(
-                        get_resource_group(rg_id_2).unwrap().get_write_bandwidth(),
-                        write_bandwidth_3
-                    );
-                })
-                .unwrap()
-        });
-        block_on(handle).unwrap();
-
-        let uri_4 = Uri::builder()
-            .scheme("http")
-            .authority(status_server.listening_addr().to_string().as_str())
-            .path_and_query("/config_resource_group")
-            .build()
-            .unwrap();
-
-        let mut set_resource_group_request = Request::new(Body::from(
-            serde_json::to_string({
-                &ResourceGroup::new(rg_id_1, cpu_quota_2, read_bandwidth_2, write_bandwidth_2)
-            })
-            .unwrap(),
-        ));
-        *set_resource_group_request.method_mut() = Method::DELETE;
-        *set_resource_group_request.uri_mut() = uri_4;
-        set_resource_group_request.headers_mut().insert(
-            hyper::header::CONTENT_TYPE,
-            hyper::header::HeaderValue::from_static("application/json"),
-        );
-
-        let handle = status_server.thread_pool.spawn(async move {
-            Client::new()
-                .request(set_resource_group_request)
-                .await
-                .map(move |res| {
-                    assert_eq!(res.status(), StatusCode::OK);
-                    assert_eq!(get_resource_group(rg_id_1), None);
-                    assert_eq!(
-                        get_resource_group(rg_id_2).unwrap().get_resource_group_id(),
-                        rg_id_2
-                    );
-                })
-                .unwrap()
-        });
-        block_on(handle).unwrap();
-
         status_server.stop();
     }
 }

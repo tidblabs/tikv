@@ -9,12 +9,14 @@ use engine_rocks::RocksEngine;
 use grpcio::{EnvBuilder, ResourceQuota};
 use raft_log_engine::RaftLogEngine;
 use raftstore::store::{fsm::create_raft_batch_system, SnapManager};
+use resource_control::ResourceGroupManager;
 use security::SecurityManager;
 use tempfile::TempDir;
 use tikv::{
     config::{ConfigController, TikvConfig},
     server::{
         config::{Config as ServerConfig, ServerConfigManager},
+        raftkv::RaftRouterWrap,
         snap::{Runner as SnapHandler, Task as SnapTask},
     },
 };
@@ -44,7 +46,10 @@ fn start_server(
             .name_prefix(thd_name!("test-server"))
             .build(),
     );
-    let (raft_router, _) = create_raft_batch_system::<RocksEngine, RaftLogEngine>(&cfg.raft_store);
+    let (raft_router, _) = create_raft_batch_system::<RocksEngine, RaftLogEngine>(
+        &cfg.raft_store,
+        &Arc::new(ResourceGroupManager::new()),
+    );
     let mut snap_worker = Worker::new("snap-handler").lazy_build("snap-handler");
     let snap_worker_scheduler = snap_worker.scheduler();
     let server_config = Arc::new(VersionTrack::new(cfg.server.clone()));
@@ -60,7 +65,7 @@ fn start_server(
     let snap_runner = SnapHandler::new(
         Arc::clone(&env),
         snap_mgr.clone(),
-        raft_router,
+        RaftRouterWrap::new(raft_router),
         security_mgr,
         Arc::clone(&server_config),
     );

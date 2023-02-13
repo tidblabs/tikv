@@ -18,6 +18,7 @@ use collections::HashMap;
 use engine_traits::{KvEngine, RaftEngine, RAFT_LOG_MULTI_GET_CNT};
 use fail::fail_point;
 use kvproto::{
+    kvrpcpb::CommandPri,
     metapb,
     raft_serverpb::{RaftApplyState, RaftLocalState},
 };
@@ -30,7 +31,11 @@ use super::{
     metrics::*, peer_storage::storage_error, WriteTask, MEMTRACE_ENTRY_CACHE, RAFT_INIT_LOG_INDEX,
     RAFT_INIT_LOG_TERM,
 };
-use crate::{bytes_capacity, store::ReadTask, Result};
+use crate::{
+    bytes_capacity,
+    store::{ProposalContext, ReadTask},
+    Result,
+};
 
 const MAX_ASYNC_FETCH_TRY_CNT: usize = 3;
 const SHRINK_CACHE_CAPACITY: usize = 64;
@@ -66,6 +71,13 @@ impl CachedEntries {
         CachedEntries {
             entries: Arc::new(Mutex::new((entries, 0))),
             range,
+        }
+    }
+
+    pub fn iter_entries(&self, mut f: impl FnMut(&Entry)) {
+        let entries = self.entries.lock().unwrap();
+        for entry in &entries.0 {
+            f(entry);
         }
     }
 
@@ -959,6 +971,16 @@ impl<EK: KvEngine, ER: RaftEngine> EntryStorage<EK, ER> {
     }
 
     #[inline]
+    pub fn set_truncated_index(&mut self, index: u64) {
+        self.apply_state.mut_truncated_state().set_index(index)
+    }
+
+    #[inline]
+    pub fn set_truncated_term(&mut self, term: u64) {
+        self.apply_state.mut_truncated_state().set_term(term)
+    }
+
+    #[inline]
     pub fn first_index(&self) -> u64 {
         first_index(&self.apply_state)
     }
@@ -1065,9 +1087,27 @@ impl<EK: KvEngine, ER: RaftEngine> EntryStorage<EK, ER> {
 
         self.cache.append(self.region_id, self.peer_id, &entries);
 
-        task.entries = entries;
+        task.priority = {
+            let mut pri = CommandPri::Low;
+            for entry in &entries {
+                // let header = util::get_entry_header(entry);
+                let group_name =
+                    ProposalContext::from_bytes(entry.get_context()).resource_group_name;
+                *task.groups.entry(group_name).or_default() += entry.compute_size() as u64;
+                // let ent_pri = header.get_priority();
+                // if ent_pri == CommandPri::High {
+                //     pri = CommandPri::High;
+                //     break;
+                // } else if ent_pri == CommandPri::Low {
+                //     // do nothing
+                // } else {
+                //     pri = CommandPri::Normal;
+                // }
+            }
+            pri
+        };
         // Delete any previously appended log entries which never committed.
-        task.cut_logs = Some((last_index + 1, prev_last_index + 1));
+        task.set_append(Some(prev_last_index + 1), entries);
 
         self.raft_state.set_last_index(last_index);
         self.last_term = last_term;
@@ -1216,6 +1256,10 @@ impl<EK: KvEngine, ER: RaftEngine> EntryStorage<EK, ER> {
             let drain_to = if half { cache_len / 2 } else { cache_len - 1 };
             let idx = cache.cache[drain_to].index;
             let mem_size_change = cache.compact_to(idx + 1);
+            RAFT_ENTRIES_EVICT_BYTES.inc_by(mem_size_change);
+        } else if !half {
+            let cache = &mut self.cache;
+            let mem_size_change = cache.compact_to(u64::MAX);
             RAFT_ENTRIES_EVICT_BYTES.inc_by(mem_size_change);
         }
     }

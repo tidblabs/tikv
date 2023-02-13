@@ -24,15 +24,15 @@ pub use self::{
         cleanup::cleanup,
         commit::commit,
         flashback_to_version::{
-            flashback_to_version_lock, flashback_to_version_read_lock,
-            flashback_to_version_read_write, flashback_to_version_write, FLASHBACK_BATCH_SIZE,
+            flashback_to_version_read_lock, flashback_to_version_read_write,
+            flashback_to_version_write, rollback_locks, FLASHBACK_BATCH_SIZE,
         },
         gc::gc,
         prewrite::{prewrite, CommitKind, TransactionKind, TransactionProperties},
     },
     commands::{Command, RESOLVE_LOCK_BATCH_SIZE},
     latch::{Latches, Lock},
-    scheduler::Scheduler,
+    scheduler::TxnScheduler,
     store::{
         EntryBatch, FixtureStore, FixtureStoreScanner, Scanner, SnapshotStore, Store, TxnEntry,
         TxnEntryScanner, TxnEntryStore,
@@ -45,6 +45,7 @@ use crate::storage::{
 };
 
 /// Process result of a command.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ProcessResult {
     Res,

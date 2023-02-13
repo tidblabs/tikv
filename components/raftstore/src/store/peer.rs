@@ -70,14 +70,14 @@ use uuid::Uuid;
 
 use super::{
     cmd_resp,
-    local_metrics::{RaftMetrics, TimeTracker},
+    local_metrics::RaftMetrics,
     metrics::*,
     peer_storage::{write_peer_state, CheckApplyingSnapStatus, HandleReadyResult, PeerStorage},
     read_queue::{ReadIndexQueue, ReadIndexRequest},
     transport::Transport,
     util::{
-        self, check_region_epoch, is_initial_msg, AdminCmdEpochState, ChangePeerI, ConfChangeKind,
-        Lease, LeaseState, NORMAL_REQ_CHECK_CONF_VER, NORMAL_REQ_CHECK_VER,
+        self, check_req_region_epoch, is_initial_msg, AdminCmdEpochState, ChangePeerI,
+        ConfChangeKind, Lease, LeaseState, NORMAL_REQ_CHECK_CONF_VER, NORMAL_REQ_CHECK_VER,
     },
     DestroyPeerJob, LocalReadContext,
 };
@@ -141,16 +141,16 @@ impl<C: WriteCallback> ProposalQueue<C> {
 
     /// Find the trackers of given index.
     /// Caller should check if term is matched before using trackers.
-    fn find_trackers(&self, index: u64) -> Option<(u64, &SmallVec<[TimeTracker; 4]>)> {
+    pub fn find_trackers(&self, index: u64) -> Option<(u64, C::TimeTrackerListRef<'_>)> {
         self.queue
             .binary_search_by_key(&index, |p: &Proposal<_>| p.index)
             .ok()
-            .and_then(|i| {
-                self.queue[i]
-                    .cb
-                    .write_trackers()
-                    .map(|ts| (self.queue[i].term, ts))
-            })
+            .map(|i| (self.queue[i].term, self.queue[i].cb.write_trackers()))
+    }
+
+    #[inline]
+    pub fn queue_mut(&mut self) -> &mut VecDeque<Proposal<C>> {
+        &mut self.queue
     }
 
     pub fn find_propose_time(&self, term: u64, index: u64) -> Option<Timespec> {
@@ -200,7 +200,7 @@ impl<C: WriteCallback> ProposalQueue<C> {
     }
 
     #[inline]
-    fn oldest(&self) -> Option<&Proposal<C>> {
+    pub fn oldest(&self) -> Option<&Proposal<C>> {
         self.queue.front()
     }
 
@@ -232,32 +232,154 @@ impl<C: WriteCallback> ProposalQueue<C> {
 bitflags! {
     // TODO: maybe declare it as protobuf struct is better.
     /// A bitmap contains some useful flags when dealing with `eraftpb::Entry`.
-    pub struct ProposalContext: u8 {
+    pub struct ProposalContextBits: u8 {
         const SYNC_LOG       = 0b0000_0001;
         const SPLIT          = 0b0000_0010;
         const PREPARE_MERGE  = 0b0000_0100;
         const COMMIT_MERGE   = 0b0000_1000;
+        const EXTEND         = 0b1000_0000;
     }
 }
 
-impl ProposalContext {
+impl ProposalContextBits {
     /// Converts itself to a vector.
-    pub fn to_vec(self) -> Vec<u8> {
+    fn to_vec(self) -> Vec<u8> {
         if self.is_empty() {
             return vec![];
         }
         let ctx = self.bits();
         vec![ctx]
     }
+}
 
-    /// Initializes a `ProposalContext` from a byte slice.
+// Generally the length of most key is within 128. The length of value is
+// within 2GiB.
+// The algorithm can be checked in https://www.sqlite.org/src4/doc/trunk/www/varint.wiki.
+#[inline]
+fn encode_len(len: u32, buf: &mut Vec<u8>) {
+    match len {
+        0..=240 => buf.push(len as u8),
+        241..=2287 => {
+            buf.push((241 + (len - 240) / 256) as u8);
+            buf.push(((len - 240) % 256) as u8);
+        }
+        2288..=67823 => {
+            buf.push(249);
+            buf.push(((len - 2288) / 256) as u8);
+            buf.push(((len - 2288) % 256) as u8);
+        }
+        67824..=16777215 => {
+            buf.push(250);
+            let bytes = len.to_be_bytes();
+            buf.extend_from_slice(&bytes[1..]);
+        }
+        16777216..=u32::MAX => {
+            buf.push(251);
+            let bytes = len.to_be_bytes();
+            buf.extend_from_slice(&bytes);
+        }
+    }
+}
+
+#[inline]
+fn decode_len(buf: &[u8]) -> (u32, &[u8]) {
+    let (f, left) = buf.split_first().expect("decode len can't be 0");
+    match f {
+        0..=240 => (*f as u32, left),
+        241..=248 => {
+            let (s, left) = left.split_first().expect("decode len can't be 1");
+            (240 + ((*f as u32) - 241) * 256 + *s as u32, left)
+        }
+        249 => {
+            let (f, left) = left.split_at(2);
+            (2288 + (f[0] as u32) * 256 + f[1] as u32, left)
+        }
+        250 => {
+            let (f, left) = left.split_at(3);
+            (u32::from_be_bytes([0, f[0], f[1], f[2]]), left)
+        }
+        251 => {
+            let (f, left) = left.split_at(4);
+            (u32::from_be_bytes([f[0], f[1], f[2], f[3]]), left)
+        }
+        _ => panic!("invalid len byte: {}", f),
+    }
+}
+
+#[inline]
+fn encode_bytes(bytes: &[u8], buf: &mut Vec<u8>) {
+    encode_len(bytes.len() as u32, buf);
+    buf.extend_from_slice(bytes);
+}
+
+#[inline]
+fn decode_bytes(buf: &[u8]) -> (&[u8], &[u8]) {
+    let (len, left) = decode_len(buf);
+    left.split_at(len as usize)
+}
+
+#[derive(Debug)]
+pub struct ProposalContext {
+    bits: ProposalContextBits,
+    pub resource_group_name: String,
+}
+
+impl std::ops::Deref for ProposalContext {
+    type Target = ProposalContextBits;
+
+    fn deref(&self) -> &ProposalContextBits {
+        &self.bits
+    }
+}
+
+impl std::ops::DerefMut for ProposalContext {
+    fn deref_mut(&mut self) -> &mut ProposalContextBits {
+        &mut self.bits
+    }
+}
+
+impl ProposalContext {
+    pub fn new(bit: ProposalContextBits) -> ProposalContext {
+        ProposalContext {
+            bits: bit,
+            resource_group_name: "".to_string(),
+        }
+    }
+
+    pub fn empty() -> ProposalContext {
+        ProposalContext {
+            bits: ProposalContextBits::empty(),
+            resource_group_name: "".to_string(),
+        }
+    }
+
+    pub fn to_vec(mut self) -> Vec<u8> {
+        if self.resource_group_name.len() != 0 {
+            self.bits |= ProposalContextBits::EXTEND;
+        }
+        let mut b = self.bits.to_vec();
+        encode_bytes(self.resource_group_name.as_bytes(), &mut b);
+        b
+    }
+
     pub fn from_bytes(ctx: &[u8]) -> ProposalContext {
         if ctx.is_empty() {
-            ProposalContext::empty()
-        } else if ctx.len() == 1 {
-            ProposalContext::from_bits_truncate(ctx[0])
+            return ProposalContext {
+                bits: ProposalContextBits::empty(),
+                resource_group_name: "".to_string(),
+            };
+        }
+        let bits = ProposalContextBits::from_bits_truncate(ctx[0]);
+        let resource_group_name = if bits.contains(ProposalContextBits::EXTEND) {
+            decode_bytes(&ctx[1..]).0
         } else {
-            panic!("invalid ProposalContext {:?}", ctx);
+            b""
+        };
+        ProposalContext {
+            bits,
+            resource_group_name: unsafe {
+                String::from_utf8_unchecked(resource_group_name.to_vec())
+            },
         }
     }
 }
@@ -939,6 +1061,15 @@ where
     /// The index of last compacted raft log. It is used for the next compact
     /// log task.
     pub last_compacted_idx: u64,
+    /// Record the time of the last raft log compact, the witness should query
+    /// the leader periodically whether `voter_replicated_index` is updated
+    /// if CompactLog admin command isn't triggered for a while.
+    pub last_compacted_time: Instant,
+    /// When the peer is witness, and there is any voter lagging behind, the
+    /// log truncation of the witness shouldn't be triggered even if it's
+    /// force mode, and this item will be set to `true`, after all pending
+    /// compact cmds have been handled, it will be set to `false`.
+    pub has_pending_compact_cmd: bool,
     /// The index of the latest urgent proposal index.
     last_urgent_proposal_idx: u64,
     /// The index of the latest committed split command.
@@ -1030,8 +1161,6 @@ where
     /// lead_transferee if this peer(leader) is in a leadership transferring.
     pub lead_transferee: u64,
     pub unsafe_recovery_state: Option<UnsafeRecoveryState>,
-    // Used as the memory state for Flashback to reject RW/Schedule before proposing.
-    pub is_in_flashback: bool,
     pub snapshot_recovery_state: Option<SnapshotRecoveryState>,
 }
 
@@ -1085,6 +1214,10 @@ where
 
         let logger = slog_global::get_global().new(slog::o!("region_id" => region.get_id()));
         let raft_group = RawNode::new(&raft_cfg, ps, &logger)?;
+        // In order to avoid excessive log accumulation due to the loss of pending
+        // compaction cmds after the witness is restarted, it will actively pull
+        // voter_request_index once at start.
+        let has_pending_compact_cmd = peer.is_witness;
 
         let mut peer = Peer {
             peer,
@@ -1120,6 +1253,8 @@ where
             tag: tag.clone(),
             last_applying_idx: applied_index,
             last_compacted_idx: 0,
+            last_compacted_time: Instant::now(),
+            has_pending_compact_cmd,
             last_urgent_proposal_idx: u64::MAX,
             last_committed_split_idx: 0,
             last_sent_snapshot_idx: 0,
@@ -1167,7 +1302,6 @@ where
             last_region_buckets: None,
             lead_transferee: raft::INVALID_ID,
             unsafe_recovery_state: None,
-            is_in_flashback: region.get_is_in_flashback(),
             snapshot_recovery_state: None,
         };
 
@@ -1175,6 +1309,9 @@ where
         if region.get_peers().len() == 1 && region.get_peers()[0].get_store_id() == store_id {
             peer.raft_group.campaign()?;
         }
+
+        let persisted_index = peer.raft_group.raft.raft_log.persisted;
+        peer.mut_store().update_cache_persisted(persisted_index);
 
         Ok(peer)
     }
@@ -1810,7 +1947,7 @@ where
                 {
                     let proposal = &self.proposals.queue[idx];
                     if term == proposal.term {
-                        for tracker in proposal.cb.write_trackers().iter().flat_map(|v| v.iter()) {
+                        for tracker in proposal.cb.write_trackers() {
                             tracker.observe(std_now, &ctx.raft_metrics.wf_send_proposal, |t| {
                                 &mut t.metrics.wf_send_proposal_nanos
                             });
@@ -2285,6 +2422,7 @@ where
                     leader_id: ss.leader_id,
                     prev_lead_transferee: self.lead_transferee,
                     vote: self.raft_group.raft.vote,
+                    initialized: self.is_initialized(),
                 },
             );
             self.cmd_epoch_checker.maybe_update_term(self.term());
@@ -2751,8 +2889,8 @@ where
             for entry in ready.entries() {
                 if let Some((term, times)) = self.proposals.find_trackers(entry.get_index()) {
                     if entry.term == term {
-                        trackers.extend_from_slice(times);
                         for tracker in times {
+                            trackers.push(*tracker);
                             tracker.observe(now, &ctx.raft_metrics.wf_send_to_queue, |t| {
                                 &mut t.metrics.wf_send_to_queue_nanos
                             });
@@ -2959,7 +3097,7 @@ where
                     let ctx = ProposalContext::from_bytes(&entry.context);
                     self.is_leader()
                         && entry.term == self.term()
-                        && ctx.contains(ProposalContext::PREPARE_MERGE)
+                        && ctx.contains(ProposalContextBits::PREPARE_MERGE)
                 },
                 |_| {}
             );
@@ -3276,7 +3414,7 @@ where
         let time = monotonic_raw_now();
         for (req, cb, mut read_index) in read.take_cmds().drain(..) {
             cb.read_tracker().map(|tracker| {
-                GLOBAL_TRACKERS.with_tracker(*tracker, |t| {
+                GLOBAL_TRACKERS.with_tracker(tracker, |t| {
                     t.metrics.read_index_confirm_wait_nanos =
                         (time - read.propose_time).to_std().unwrap().as_nanos() as u64;
                 })
@@ -3531,7 +3669,7 @@ where
             self.force_leader.is_some(),
         ) {
             None
-        } else if self.is_in_flashback {
+        } else if self.region().is_in_flashback {
             debug!(
                 "prevents renew lease while in flashback state";
                 "region_id" => self.region_id,
@@ -3671,6 +3809,7 @@ where
                     cb,
                     propose_time: None,
                     must_pass_epoch_check: has_applied_to_current_term,
+                    sent: false,
                 };
                 if let Some(cmd_type) = req_admin_cmd_type {
                     self.cmd_epoch_checker
@@ -4002,6 +4141,7 @@ where
                     cb: Callback::None,
                     propose_time: Some(now),
                     must_pass_epoch_check: false,
+                    sent: false,
                 };
                 self.post_propose(poll_ctx, p);
             }
@@ -4258,7 +4398,7 @@ where
         let mut ctx = ProposalContext::empty();
 
         if get_sync_log_from_request(req) {
-            ctx.insert(ProposalContext::SYNC_LOG);
+            ctx.insert(ProposalContextBits::SYNC_LOG);
         }
 
         if !req.has_admin_request() {
@@ -4266,14 +4406,23 @@ where
         }
 
         match req.get_admin_request().get_cmd_type() {
-            AdminCmdType::Split | AdminCmdType::BatchSplit => ctx.insert(ProposalContext::SPLIT),
+            AdminCmdType::Split | AdminCmdType::BatchSplit => {
+                ctx.insert(ProposalContextBits::SPLIT)
+            }
             AdminCmdType::PrepareMerge => {
                 self.pre_propose_prepare_merge(poll_ctx, req)?;
-                ctx.insert(ProposalContext::PREPARE_MERGE);
+                ctx.insert(ProposalContextBits::PREPARE_MERGE);
             }
-            AdminCmdType::CommitMerge => ctx.insert(ProposalContext::COMMIT_MERGE),
+            AdminCmdType::CommitMerge => ctx.insert(ProposalContextBits::COMMIT_MERGE),
             _ => {}
         }
+
+        ctx.resource_group_name = req.get_header().get_resource_group_name().to_owned();
+        // if req.get_header().get_priority() == CommandPri::High {
+        //     ctx.insert(ProposalContextBits::HIGH_PRIORITY);
+        // } else if req.get_header().get_priority() == CommandPri::Low {
+        //     ctx.insert(ProposalContextBits::LOW_PRIORITY);
+        // }
 
         Ok(ctx)
     }
@@ -4516,7 +4665,7 @@ where
         self.raft_group.raft.msgs.push(msg);
     }
 
-    /// Return true to if the transfer leader request is accepted.
+    /// Return true if the transfer leader request is accepted.
     ///
     /// When transferring leadership begins, leader sends a pre-transfer
     /// to target follower first to ensures it's ready to become leader.
@@ -4692,7 +4841,7 @@ where
 
         let propose_index = self.next_proposal_index();
         self.raft_group
-            .propose_conf_change(ProposalContext::SYNC_LOG.to_vec(), cc)?;
+            .propose_conf_change(ProposalContextBits::SYNC_LOG.to_vec(), cc)?;
         if self.next_proposal_index() == propose_index {
             // The message is dropped silently, this usually due to leader absence
             // or transferring leader. Both cases can be considered as NotLeader error.
@@ -4711,7 +4860,7 @@ where
     ) -> ReadResponse<EK::Snapshot> {
         let region = self.region().clone();
         if check_epoch {
-            if let Err(e) = check_region_epoch(&req, &region, true) {
+            if let Err(e) = check_req_region_epoch(&req, &region, true) {
                 debug!("epoch not match"; "region_id" => region.get_id(), "err" => ?e);
                 let mut response = cmd_resp::new_error(e);
                 cmd_resp::bind_term(&mut response, self.term());
@@ -5658,7 +5807,7 @@ fn is_request_urgent(req: &RaftCmdRequest) -> bool {
     )
 }
 
-fn make_transfer_leader_response() -> RaftCmdResponse {
+pub fn make_transfer_leader_response() -> RaftCmdResponse {
     let mut response = AdminResponse::default();
     response.set_cmd_type(AdminCmdType::TransferLeader);
     response.set_transfer_leader(TransferLeaderResponse::default());
@@ -5714,6 +5863,7 @@ mod memtrace {
 mod tests {
     use kvproto::raft_cmdpb;
     use protobuf::ProtobufEnum;
+    use rand::{distributions::Alphanumeric, thread_rng, Rng};
 
     use super::*;
     use crate::store::{msg::ExtCallback, util::u64_to_timespec};
@@ -5768,14 +5918,20 @@ mod tests {
 
     #[test]
     fn test_entry_context() {
-        let tbl: Vec<&[ProposalContext]> = vec![
-            &[ProposalContext::SPLIT],
-            &[ProposalContext::SYNC_LOG],
-            &[ProposalContext::PREPARE_MERGE],
-            &[ProposalContext::COMMIT_MERGE],
-            &[ProposalContext::SPLIT, ProposalContext::SYNC_LOG],
-            &[ProposalContext::PREPARE_MERGE, ProposalContext::SYNC_LOG],
-            &[ProposalContext::COMMIT_MERGE, ProposalContext::SYNC_LOG],
+        let tbl: Vec<&[ProposalContextBits]> = vec![
+            &[ProposalContextBits::SPLIT],
+            &[ProposalContextBits::SYNC_LOG],
+            &[ProposalContextBits::PREPARE_MERGE],
+            &[ProposalContextBits::COMMIT_MERGE],
+            &[ProposalContextBits::SPLIT, ProposalContextBits::SYNC_LOG],
+            &[
+                ProposalContextBits::PREPARE_MERGE,
+                ProposalContextBits::SYNC_LOG,
+            ],
+            &[
+                ProposalContextBits::COMMIT_MERGE,
+                ProposalContextBits::SYNC_LOG,
+            ],
         ];
 
         for flags in tbl {
@@ -5784,12 +5940,22 @@ mod tests {
                 ctx.insert(*f);
             }
 
+            let mut rng = thread_rng();
+            let len = rng.gen_range(0..30);
+            let rand_string: String = rng
+                .sample_iter(&Alphanumeric)
+                .take(len)
+                .map(char::from)
+                .collect();
+            ctx.resource_group_name = rand_string.clone();
+
             let ser = ctx.to_vec();
             let de = ProposalContext::from_bytes(&ser);
 
             for f in flags {
                 assert!(de.contains(*f), "{:?}", de);
             }
+            assert_eq!(de.resource_group_name, rand_string);
         }
     }
 
@@ -5925,6 +6091,7 @@ mod tests {
                 cb: Callback::write(Box::new(|_| {})),
                 propose_time: Some(u64_to_timespec(index)),
                 must_pass_epoch_check: false,
+                sent: false,
             });
         };
         for index in 1..=100 {
@@ -5998,6 +6165,7 @@ mod tests {
                 is_conf_change: false,
                 propose_time: None,
                 must_pass_epoch_check: false,
+                sent: false,
             });
         }
         for (index, term) in entries {
