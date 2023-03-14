@@ -22,7 +22,7 @@ pub fn bounded<T: Send + 'static>(
 ) -> (Sender<T>, Receiver<T>) {
     if let Some(ctl) = resource_ctl {
         // TODO: make it bounded
-        let (tx, rx) = priority_queue::unbounded();
+        let (tx, rx) = channel::unbounded();
         (
             Sender::Priority {
                 resource_ctl: ctl,
@@ -41,7 +41,7 @@ pub fn unbounded<T: Send + 'static>(
     resource_ctl: Option<Arc<ResourceController>>,
 ) -> (Sender<T>, Receiver<T>) {
     if let Some(ctl) = resource_ctl {
-        let (tx, rx) = priority_queue::unbounded();
+        let (tx, rx) = channel::unbounded();
         (
             Sender::Priority {
                 resource_ctl: ctl,
@@ -60,7 +60,7 @@ pub enum Sender<T: Send + 'static> {
     Vanilla(channel::Sender<T>),
     Priority {
         resource_ctl: Arc<ResourceController>,
-        sender: priority_queue::Sender<T>,
+        sender: channel::Sender<T>,
         last_msg_group: RefCell<String>,
     },
 }
@@ -101,7 +101,7 @@ impl<T: Send + 'static> Sender<T> {
                         .get_priority(last_msg_group.borrow().as_bytes(), CommandPri::Normal),
                     low_bound,
                 );
-                sender.send(m, priority).map(|_| priority)
+                sender.send(m).map(|_| 0)
             }
         }
     }
@@ -119,7 +119,7 @@ impl<T: Send + 'static> Sender<T> {
                         .get_priority(last_msg_group.borrow().as_bytes(), CommandPri::Normal),
                     low_bound,
                 );
-                sender.try_send(m, priority).map(|_| priority)
+                sender.try_send(m).map(|_| 0)
             }
         }
     }
@@ -154,7 +154,7 @@ impl<T: Send + 'static> Sender<T> {
 
 pub enum Receiver<T: Send + 'static> {
     Vanilla(channel::Receiver<T>),
-    Priority(priority_queue::Receiver<T>),
+    Priority(channel::Receiver<T>),
 }
 
 impl<T: Send + 'static> Clone for Receiver<T> {
