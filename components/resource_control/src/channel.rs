@@ -22,7 +22,7 @@ pub fn bounded<T: Send + 'static>(
 ) -> (Sender<T>, Receiver<T>) {
     if let Some(ctl) = resource_ctl {
         // TODO: make it bounded
-        let (tx, rx) = priority_queue::unbounded();
+        let (tx, rx) = channel::unbounded();
         (
             Sender::Priority {
                 resource_ctl: ctl,
@@ -41,7 +41,7 @@ pub fn unbounded<T: Send + 'static>(
     resource_ctl: Option<Arc<ResourceController>>,
 ) -> (Sender<T>, Receiver<T>) {
     if let Some(ctl) = resource_ctl {
-        let (tx, rx) = priority_queue::unbounded();
+        let (tx, rx) = channel::unbounded();
         (
             Sender::Priority {
                 resource_ctl: ctl,
@@ -60,7 +60,7 @@ pub enum Sender<T: Send + 'static> {
     Vanilla(channel::Sender<T>),
     Priority {
         resource_ctl: Arc<ResourceController>,
-        sender: priority_queue::Sender<T>,
+        sender: channel::Sender<T>,
         last_msg_group: RefCell<String>,
     },
 }
@@ -96,12 +96,12 @@ impl<T: Send + 'static> Sender<T> {
                 last_msg_group,
             } => {
                 // TODO: pass different command priority
-                let priority = std::cmp::max(
-                    resource_ctl
-                        .get_priority(last_msg_group.borrow().as_bytes(), CommandPri::Normal),
-                    low_bound,
-                );
-                sender.send(m, priority).map(|_| priority)
+                // let priority = std::cmp::max(
+                //     resource_ctl
+                //         .get_priority(last_msg_group.borrow().as_bytes(), CommandPri::Normal),
+                //     low_bound,
+                // );
+                sender.send(m).map(|_| 0)
             }
         }
     }
@@ -114,12 +114,12 @@ impl<T: Send + 'static> Sender<T> {
                 sender,
                 last_msg_group,
             } => {
-                let priority = std::cmp::max(
-                    resource_ctl
-                        .get_priority(last_msg_group.borrow().as_bytes(), CommandPri::Normal),
-                    low_bound,
-                );
-                sender.try_send(m, priority).map(|_| priority)
+                // let priority = std::cmp::max(
+                //     resource_ctl
+                //         .get_priority(last_msg_group.borrow().as_bytes(), CommandPri::Normal),
+                //     low_bound,
+                // );
+                sender.try_send(m).map(|_| 0)
             }
         }
     }
@@ -132,21 +132,21 @@ impl<T: Send + 'static> Sender<T> {
                 last_msg_group,
                 ..
             } => {
-                if let Some(mut groups) = msg.get_resource_consumptions() {
-                    let mut dominant_group = "".to_owned();
-                    let mut max_write_bytes = 0;
-                    for (group_name, write_bytes) in groups.drain() {
-                        resource_ctl.consume(
-                            group_name.as_bytes(),
-                            ResourceConsumeType::IoBytes(write_bytes),
-                        );
-                        if write_bytes > max_write_bytes {
-                            dominant_group = group_name;
-                            max_write_bytes = write_bytes;
-                        }
-                    }
-                    *last_msg_group.borrow_mut() = dominant_group;
-                }
+                // if let Some(mut groups) = msg.get_resource_consumptions() {
+                //     let mut dominant_group = "".to_owned();
+                //     let mut max_write_bytes = 0;
+                //     for (group_name, write_bytes) in groups.drain() {
+                //         resource_ctl.consume(
+                //             group_name.as_bytes(),
+                //             ResourceConsumeType::IoBytes(write_bytes),
+                //         );
+                //         if write_bytes > max_write_bytes {
+                //             dominant_group = group_name;
+                //             max_write_bytes = write_bytes;
+                //         }
+                //     }
+                //     *last_msg_group.borrow_mut() = dominant_group;
+                // }
             }
         }
     }
@@ -154,7 +154,7 @@ impl<T: Send + 'static> Sender<T> {
 
 pub enum Receiver<T: Send + 'static> {
     Vanilla(channel::Receiver<T>),
-    Priority(priority_queue::Receiver<T>),
+    Priority(channel::Receiver<T>),
 }
 
 impl<T: Send + 'static> Clone for Receiver<T> {
